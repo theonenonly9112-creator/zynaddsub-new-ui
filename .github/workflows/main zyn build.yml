@@ -465,6 +465,229 @@ jobs:
           grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
           psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
           sed -n 715,730p src/main.cpp
+      - name: Apply unified UI (stage 1)
+        run: |
+          cd zynaddsubfx-3.0.3
+          cat > src/UI/UnifiedShell.h <<'HEOF'
+          // UnifiedShell.h - single-window layout, stage 1
+          #pragma once
+          class MasterUI;
+          void zyn_unified_shell(MasterUI *ui);
+          HEOF
+          cat > src/UI/UnifiedShell.cpp <<'CPPEOF'
+          // UnifiedShell.cpp - stage 1 of the single-window UI.
+          // Resizes the existing main window to 1000x680, adds a tab bar
+          // (ENGINES / FX / MATRIX / GLOBAL), a keyboard and an envelope strip
+          // placeholder, and moves the EXISTING widgets into the tab pages.
+          // Set the environment variable ZYN_CLASSIC_UI=1 to keep the old layout.
+          #include "UnifiedShell.h"
+          #include "MasterUI.h"
+          #include "Fl_Osc_Pane.H"
+          #include <FL/Fl.H>
+          #include <FL/Fl_Box.H>
+          #include <FL/Fl_Button.H>
+          #include <FL/Fl_Group.H>
+          #include <FL/Fl_Menu_Bar.H>
+          #include <FL/Fl_Tabs.H>
+          #include <FL/fl_draw.H>
+          #include <stdint.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <vector>
+
+          namespace {
+
+          const int WIN_W = 1000, WIN_H = 680;
+          const int MENU_H = 25, TAB_H = 34, KB_H = 56, KB_W = 590;
+          const int STRIP_H = 104, PAD = 8;
+
+          Fl_Group  *g_pages[4] = {0, 0, 0, 0};
+          Fl_Button *g_tabs[4]  = {0, 0, 0, 0};
+
+          void show_page(int n)
+          {
+              for(int i = 0; i < 4; ++i) {
+                  if(g_pages[i]) {
+                      if(i == n)
+                          g_pages[i]->show();
+                      else
+                          g_pages[i]->hide();
+                  }
+                  if(g_tabs[i])
+                      g_tabs[i]->value(i == n ? 1 : 0);
+              }
+              if(g_pages[n] && g_pages[n]->window())
+                  g_pages[n]->window()->redraw();
+          }
+
+          void tab_cb(Fl_Widget *, void *d)
+          {
+              show_page((int)(intptr_t)d);
+          }
+
+          Fl_Group *make_page(int y, int h)
+          {
+              Fl_Group *g = new Fl_Group(0, y, WIN_W, h);
+              g->box(FL_FLAT_BOX);
+              g->color(fl_rgb_color(14, 18, 24));
+              g->end();
+              return g;
+          }
+
+          void note(Fl_Group *page, int x, int y, int w, int h, const char *text)
+          {
+              page->begin();
+              Fl_Box *b = new Fl_Box(x, y, w, h, text);
+              b->box(FL_FLAT_BOX);
+              b->color(fl_rgb_color(22, 30, 40));
+              b->labelcolor(fl_rgb_color(143, 167, 176));
+              b->labelsize(12);
+              b->align(FL_ALIGN_CENTER | FL_ALIGN_WRAP);
+              page->end();
+          }
+
+          void move_into(Fl_Group *page, Fl_Widget *w, int x, int y)
+          {
+              if(!w)
+                  return;
+              page->add(w);
+              w->position(x, y);
+          }
+
+          } // namespace
+
+          void zyn_unified_shell(MasterUI *ui)
+          {
+              static bool done = false;
+              if(done)
+                  return;
+              done = true;
+
+              if(getenv("ZYN_CLASSIC_UI"))
+                  return;
+              if(!ui || !ui->masterwindow || !ui->win_root ||
+                 !ui->partuigroup || !ui->syseffectuigroup)
+                  return;
+
+              Fl_Window *win = ui->masterwindow;
+
+              // the effects tab widget is the grandparent of the system effect group
+              Fl_Tabs *fxtabs = 0;
+              if(ui->syseffectuigroup->parent() && ui->syseffectuigroup->parent()->parent())
+                  fxtabs = dynamic_cast<Fl_Tabs *>(ui->syseffectuigroup->parent()->parent());
+
+              // collect everything in the old main panel that is neither the menu bar,
+              // the part panel, the effect tabs nor a tiny helper box: master controls
+              std::vector<Fl_Widget *> master_widgets;
+              Fl_Menu_Bar *menu = 0;
+              for(int i = 0; i < ui->win_root->children(); ++i) {
+                  Fl_Widget *c = ui->win_root->child(i);
+                  if(!menu) {
+                      if(Fl_Menu_Bar *m = dynamic_cast<Fl_Menu_Bar *>(c)) {
+                          menu = m;
+                          continue;
+                      }
+                  }
+                  if(c == ui->partuigroup || c == fxtabs)
+                      continue;
+                  if(c->w() <= 30 && c->h() <= 30 && (!c->label() || !c->label()[0]))
+                      continue;
+                  master_widgets.push_back(c);
+              }
+
+              // resize without scaling the children
+              win->resizable(NULL);
+              ui->win_root->resizable(NULL);
+              win->size(WIN_W, WIN_H);
+              ui->win_root->resize(0, 0, WIN_W, WIN_H);
+              if(menu)
+                  menu->resize(0, 0, WIN_W, MENU_H);
+
+              const int page_y  = MENU_H + TAB_H;
+              const int kb_y    = WIN_H - KB_H - PAD;
+              const int strip_y = kb_y - STRIP_H - PAD;
+              const int page_h  = strip_y - PAD - page_y;
+
+              win->begin();
+
+              Fl_Box *bar = new Fl_Box(0, MENU_H, WIN_W, TAB_H);
+              bar->box(FL_FLAT_BOX);
+              bar->color(fl_rgb_color(10, 14, 19));
+
+              static const char *names[4] = {"ENGINES", "FX", "MATRIX", "GLOBAL"};
+              for(int i = 0; i < 4; ++i) {
+                  Fl_Button *b = new Fl_Button(16 + i * 110, MENU_H + 4, 104, TAB_H - 8, names[i]);
+                  b->type(FL_RADIO_BUTTON);
+                  b->box(FL_FLAT_BOX);
+                  b->down_box(FL_FLAT_BOX);
+                  b->color(fl_rgb_color(22, 30, 40));
+                  b->selection_color(fl_rgb_color(0, 128, 76));
+                  b->labelcolor(fl_rgb_color(215, 240, 230));
+                  b->labelfont(FL_HELVETICA_BOLD);
+                  b->labelsize(13);
+                  b->clear_visible_focus();
+                  b->callback(tab_cb, (void *)(intptr_t)i);
+                  g_tabs[i] = b;
+              }
+
+              for(int i = 0; i < 4; ++i)
+                  g_pages[i] = make_page(page_y, page_h);
+
+              Fl_Box *strip = new Fl_Box(PAD, strip_y, WIN_W - 2 * PAD, STRIP_H,
+                                         "ENVELOPE EDITOR\nStage 3 shows the selected envelope here");
+              strip->box(FL_FLAT_BOX);
+              strip->color(fl_rgb_color(22, 30, 40));
+              strip->labelcolor(fl_rgb_color(143, 167, 176));
+              strip->labelsize(12);
+
+              VirKeys *kb = new VirKeys((WIN_W - KB_W) / 2, kb_y, KB_W, KB_H, "Keyboard");
+              kb->box(FL_BORDER_BOX);
+              kb->color(17);
+              kb->init(ui->osc, "/");
+
+              win->end();
+
+              // move the existing widgets into their pages
+              move_into(g_pages[0], ui->partuigroup, PAD, page_y + PAD);
+              if(fxtabs)
+                  move_into(g_pages[1], fxtabs, PAD, page_y + PAD);
+              for(size_t i = 0; i < master_widgets.size(); ++i) {
+                  Fl_Widget *w = master_widgets[i];
+                  g_pages[3]->add(w);
+                  w->position(w->x() + PAD, w->y() - MENU_H + page_y + PAD);
+              }
+
+              const int nx = PAD + 390 + PAD;
+              const int nw = WIN_W - nx - PAD;
+              note(g_pages[0], nx, page_y + PAD, nw, 205,
+                   "ENGINES\n\nClick 'Edit instrument' to open the ADD / SUB / PAD editors.\n"
+                   "Stage 2 will show them here, inside this window.");
+              note(g_pages[1], nx, page_y + PAD, nw, 165,
+                   "FX\n\nSystem and insertion effects are on the left.\n"
+                   "Stage 3 turns this tab into the effect rack and editor.");
+              note(g_pages[2], PAD, page_y + PAD, WIN_W - 2 * PAD, 120,
+                   "MATRIX\n\nKit edit and the ADD voice list will live here (Stage 3).");
+              note(g_pages[3], nx, page_y + PAD, nw, 120,
+                   "GLOBAL\n\nMaster controls are on the left.\n"
+                   "Voicing, portamento and part settings follow in Stage 3.");
+
+              show_page(0);
+              win->redraw();
+          }
+          CPPEOF
+          python3 - <<'PYEOF'
+          def patch(path, old, new):
+              s = open(path).read()
+              assert s.count(old) == 1, (path, old[:60], s.count(old))
+              open(path, 'w').write(s.replace(old, new))
+          patch('src/UI/CMakeLists.txt', '        NioUI.cpp\n', '        NioUI.cpp\n        UnifiedShell.cpp\n')
+          patch('src/UI/MasterUI.fl', 'decl {\\#include "NioUI.h"} {public global',
+                'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "NioUI.h"} {public global')
+          patch('src/UI/MasterUI.fl', 'swapefftype=0;\nsimplerefresh();} {}',
+                'swapefftype=0;\nsimplerefresh();\nzyn_unified_shell(this);} {}')
+          print('unified ui stage 1 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
