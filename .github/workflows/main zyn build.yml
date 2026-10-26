@@ -688,6 +688,82 @@ jobs:
           print('unified ui stage 1 patches applied')
           PYEOF
 
+      - name: Crash diagnostics (abort hook and exit markers)
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def patch(path, old, new):
+              s = open(path).read()
+              assert s.count(old) == 1, (path, old[:60], s.count(old))
+              open(path, 'w').write(s.replace(old, new))
+          HOOKS = r'''
+          /* abort() and uncaught C++ exceptions do not raise a normal crash, so hook them too */
+          static void zyn_report_stack(const char *why)
+          {
+              void *frames[40];
+              USHORT n = RtlCaptureStackBackTrace(0, 40, frames, NULL);
+              fprintf(stderr, "\n[ABORT] %s\n", why);
+              for(USHORT i = 0; i < n; i++) {
+                  HMODULE m = NULL;
+                  char name[MAX_PATH];
+                  name[0] = '\0';
+                  if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                        (LPCSTR)frames[i], &m) && m)
+                      GetModuleFileNameA(m, name, MAX_PATH);
+                  const char *base = strrchr(name, '\\');
+                  base = base ? base + 1 : name;
+                  fprintf(stderr, "[ABORT]  #%u %s +0x%lX (0x%08lX)\n", (unsigned)i, base,
+                          (unsigned long)((char *)frames[i] - (char *)m), (unsigned long)frames[i]);
+              }
+              fflush(stderr);
+          }
+          static void zyn_on_sigabrt(int)
+          {
+              signal(SIGABRT, SIG_DFL);
+              zyn_report_stack("abort() was called");
+              raise(SIGABRT);
+          }
+          static void zyn_on_terminate()
+          {
+              std::exception_ptr p = std::current_exception();
+              if(p) {
+                  try { std::rethrow_exception(p); }
+                  catch(const std::exception &e) { fprintf(stderr, "\n[ABORT] uncaught C++ exception: %s\n", e.what()); }
+                  catch(...) { fprintf(stderr, "\n[ABORT] uncaught C++ exception of unknown type\n"); }
+              }
+              zyn_report_stack("std::terminate");
+              signal(SIGABRT, SIG_DFL);
+              abort();
+          }
+          static void zyn_install_abort_hooks(void)
+          {
+              signal(SIGABRT, zyn_on_sigabrt);
+              std::set_terminate(zyn_on_terminate);
+          }
+          '''[1:]
+          EXIT_OLD = '    Nio::stop();\n    config.save();\n    middleware->removeAutoSave();\n\n    GUI::destroyUi(gui);\n    delete middleware;\n'
+          EXIT_NEW = r'''
+              fprintf(stderr, "[EXIT] begin\n");
+              Nio::stop();
+              fprintf(stderr, "[EXIT] audio stopped\n");
+              config.save();
+              fprintf(stderr, "[EXIT] config saved\n");
+              middleware->removeAutoSave();
+
+              GUI::destroyUi(gui);
+              fprintf(stderr, "[EXIT] UI destroyed\n");
+              delete middleware;
+              fprintf(stderr, "[EXIT] middleware deleted\n");
+          '''[1:]
+          patch('src/crashreport.h', '#include <io.h>\n', '#include <io.h>\n#include <signal.h>\n#include <exception>\n')
+          patch('src/crashreport.h', '/* write everything the program prints', HOOKS + '/* write everything the program prints')
+          patch('src/main.cpp', 'zyn_open_log("zyn-log.txt");', 'zyn_open_log("zyn-log.txt");\n    zyn_install_abort_hooks();')
+          patch('src/UI/guimain.cpp', 'zyn_open_log("zyn-gui-log.txt");', 'zyn_open_log("zyn-gui-log.txt");\n    zyn_install_abort_hooks();')
+          patch('src/main.cpp', EXIT_OLD, EXIT_NEW)
+          print('crash diagnostics applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
