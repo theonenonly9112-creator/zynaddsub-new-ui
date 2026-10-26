@@ -1,0 +1,141 @@
+name: Build ZynAddSubFX (Windows 32-bit)
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: "Release or Debug"
+        default: "Release"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    env:
+      BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (32-bit MinGW)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW32
+          update: true
+          install: >-
+            git
+            make
+            curl
+            tar
+            mingw-w64-i686-toolchain
+            mingw-w64-i686-cmake
+            mingw-w64-i686-ninja
+            mingw-w64-i686-pkgconf
+            mingw-w64-i686-fltk
+            mingw-w64-i686-fftw
+            mingw-w64-i686-zlib
+            mingw-w64-i686-portaudio
+            mingw-w64-i686-liblo
+
+      # Zyn needs Mini-XML 2.x (version 3 changed the API and breaks the build)
+      - name: Build Mini-XML 2.12
+        run: |
+          curl -L -o mxml.tar.gz https://github.com/michaelrsweet/mxml/releases/download/v2.12/mxml-2.12.tar.gz
+          tar xzf mxml.tar.gz
+          cd mxml-2.12
+          ./configure --prefix=/mingw32 --enable-shared=no
+          make -j2 libmxml.a
+          make install || true
+          # make sure the pkg-config file exists
+          ls /mingw32/lib/pkgconfig | grep -i mxml
+
+      # rtosc submodule folder is empty in the zip: fetch a Feb-2016 commit
+      - name: Fetch rtosc (Feb 2016)
+        run: |
+          rm -rf rtosc
+          git clone https://github.com/fundamental/rtosc.git rtosc
+          cd rtosc
+          git checkout $(git rev-list -n 1 --before="2016-02-07 00:00" master)
+          git log -1 --format='rtosc commit: %H (%cd)'
+
+      # DPF (plugin framework) submodule is also empty in the zip
+      - name: Fetch DPF (Feb 2016)
+        run: |
+          rm -rf DPF
+          git clone https://github.com/DISTRHO/DPF.git DPF
+          cd DPF
+          git checkout $(git rev-list -n 1 --before="2016-02-07 00:00" master)
+          git log -1 --format='DPF commit: %H (%cd)'
+
+      # The stock plugin CMake builds LV2 + lv2-ttl-generator (needs "dl",
+      # Linux only). Replace it with a VST2-only version for Windows.
+      - name: Patch plugin CMake for Windows VST only
+        run: |
+          cat > src/Plugin/CMakeLists.txt <<'EOF'
+          add_subdirectory(ZynAddSubFX)
+          EOF
+          cat > src/Plugin/ZynAddSubFX/CMakeLists.txt <<'EOF'
+          include_directories(${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/DPF/distrho .)
+          add_library(ZynAddSubFX_vst SHARED
+              ${CMAKE_SOURCE_DIR}/src/globals.cpp
+              ${CMAKE_SOURCE_DIR}/src/UI/ConnectionDummy.cpp
+              ${CMAKE_SOURCE_DIR}/DPF/distrho/DistrhoPluginMain.cpp
+              ZynAddSubFX.cpp)
+          set_target_properties(ZynAddSubFX_vst PROPERTIES
+              COMPILE_DEFINITIONS "DISTRHO_PLUGIN_TARGET_VST"
+              OUTPUT_NAME "ZynAddSubFX"
+              PREFIX ""
+              LINK_FLAGS "-static-libgcc -static-libstdc++")
+          target_link_libraries(ZynAddSubFX_vst zynaddsubfx_core ${OS_LIBRARIES} ${LIBLO_LIBRARIES})
+          EOF
+
+      - name: Configure
+        run: |
+          mkdir -p build
+          cd build
+          cmake -G Ninja .. \
+            -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
+            -DGuiModule=fltk \
+            -DPaEnable=ON \
+            -DDefaultOutput=portaudio \
+            -DDefaultInput=null
+
+      - name: Build
+        run: |
+          cd build
+          ninja -j2 -v
+
+      - name: Collect exe and DLLs
+        run: |
+          mkdir -p dist
+          EXE=$(find build -name 'zynaddsubfx.exe' | head -n 1)
+          echo "Found: $EXE"
+          cp "$EXE" dist/
+          ldd "$EXE" | grep -i '/mingw32/' | awk '{print $3}' | xargs -I{} cp {} dist/
+          ls -la dist
+
+      - name: Collect VST dll
+        run: |
+          mkdir -p dist-vst
+          DLL=$(find build -name 'ZynAddSubFX.dll' | head -n 1)
+          echo "Found: $DLL"
+          cp "$DLL" dist-vst/
+          ldd "$DLL" | grep -i '/mingw32/' | awk '{print $3}' | xargs -I{} cp {} dist-vst/ || true
+          ls -la dist-vst
+
+      - name: Upload standalone
+        uses: actions/upload-artifact@v4
+        with:
+          name: zynaddsubfx-win32
+          path: dist/
+
+      - name: Upload VST
+        uses: actions/upload-artifact@v4
+        with:
+          name: zynaddsubfx-vst-win32
+          path: dist-vst/
