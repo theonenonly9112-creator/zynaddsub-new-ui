@@ -1,141 +1,556 @@
-name: Build ZynAddSubFX (Windows 32-bit)
+name: Build Windows 32-bit
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
-    inputs:
-      build_type:
-        description: "Release or Debug"
-        default: "Release"
 
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 90
     defaults:
       run:
         shell: msys2 {0}
-    env:
-      BUILD_TYPE: ${{ github.event.inputs.build_type || 'Release' }}
-
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up MSYS2 (32-bit MinGW)
-        uses: msys2/setup-msys2@v2
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW32
           update: true
+          suppress-deprecation-warnings: msystem-mingw32
           install: >-
-            git
-            make
+            base-devel
             curl
             tar
+            bzip2
+            zip
+            python
             mingw-w64-i686-toolchain
             mingw-w64-i686-cmake
             mingw-w64-i686-ninja
-            mingw-w64-i686-pkgconf
-            mingw-w64-i686-fltk
-            mingw-w64-i686-fftw
             mingw-w64-i686-zlib
             mingw-w64-i686-portaudio
-            mingw-w64-i686-liblo
-
-      # Zyn needs Mini-XML 2.x (version 3 changed the API and breaks the build)
-      - name: Build Mini-XML 2.12
+            mingw-w64-i686-pkgconf
+      - name: Build fftw
         run: |
-          curl -L -o mxml.tar.gz https://github.com/michaelrsweet/mxml/releases/download/v2.12/mxml-2.12.tar.gz
-          tar xzf mxml.tar.gz
-          cd mxml-2.12
-          ./configure --prefix=/mingw32 --enable-shared=no
-          make -j2 libmxml.a
-          make install || true
-          # make sure the pkg-config file exists
-          ls /mingw32/lib/pkgconfig | grep -i mxml
-
-      # rtosc submodule folder is empty in the zip: fetch a Feb-2016 commit
-      - name: Fetch rtosc (Feb 2016)
+          mkdir -p $HOME/deps && cd $HOME/deps
+          curl -fLO https://www.fftw.org/fftw-3.3.10.tar.gz
+          tar xzf fftw-3.3.10.tar.gz && cd fftw-3.3.10
+          ./configure --prefix=/mingw32 --enable-shared --disable-static --with-our-malloc --disable-fortran
+          make -j4 && make install
+      - name: Build mxml
         run: |
-          rm -rf rtosc
-          git clone https://github.com/fundamental/rtosc.git rtosc
-          cd rtosc
-          git checkout $(git rev-list -n 1 --before="2016-02-07 00:00" master)
-          git log -1 --format='rtosc commit: %H (%cd)'
-
-      # DPF (plugin framework) submodule is also empty in the zip
-      - name: Fetch DPF (Feb 2016)
+          cd $HOME/deps
+          curl -fLO https://github.com/michaelrsweet/mxml/releases/download/v2.12/mxml-2.12.tar.gz
+          tar xzf mxml-2.12.tar.gz && cd mxml-2.12
+          CFLAGS="-include io.h -Wno-error=implicit-function-declaration" ./configure --prefix=/mingw32 --disable-shared
+          make libmxml.a
+          cp mxml.h /mingw32/include/
+          cp libmxml.a /mingw32/lib/
+          mkdir -p /mingw32/lib/pkgconfig
+          cat > /mingw32/lib/pkgconfig/mxml.pc <<PCEOF
+          prefix=/mingw32
+          libdir=\${prefix}/lib
+          includedir=\${prefix}/include
+          Name: mxml
+          Description: Mini-XML library
+          Version: 2.12
+          Libs: -L\${libdir} -lmxml
+          Cflags: -I\${includedir}
+          PCEOF
+      - name: Build liblo
+        env:
+          CFLAGS: -O2 -Wno-error=implicit-function-declaration -Wno-error=int-conversion
         run: |
-          rm -rf DPF
-          git clone https://github.com/DISTRHO/DPF.git DPF
-          cd DPF
-          git checkout $(git rev-list -n 1 --before="2016-02-07 00:00" master)
-          git log -1 --format='DPF commit: %H (%cd)'
-
-      # The stock plugin CMake builds LV2 + lv2-ttl-generator (needs "dl",
-      # Linux only). Replace it with a VST2-only version for Windows.
-      - name: Patch plugin CMake for Windows VST only
+          cd $HOME/deps
+          curl -fLO https://github.com/radarsat1/liblo/releases/download/0.32/liblo-0.32.tar.gz
+          tar xzf liblo-0.32.tar.gz && cd liblo-0.32
+          ./configure --prefix=/mingw32 --enable-shared --disable-static --disable-tests --disable-examples --disable-tools
+          make -j4 && make install
+      - name: Build fltk
         run: |
-          cat > src/Plugin/CMakeLists.txt <<'EOF'
-          add_subdirectory(ZynAddSubFX)
-          EOF
-          cat > src/Plugin/ZynAddSubFX/CMakeLists.txt <<'EOF'
-          include_directories(${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR}/DPF/distrho .)
-          add_library(ZynAddSubFX_vst SHARED
-              ${CMAKE_SOURCE_DIR}/src/globals.cpp
-              ${CMAKE_SOURCE_DIR}/src/UI/ConnectionDummy.cpp
-              ${CMAKE_SOURCE_DIR}/DPF/distrho/DistrhoPluginMain.cpp
-              ZynAddSubFX.cpp)
-          set_target_properties(ZynAddSubFX_vst PROPERTIES
-              COMPILE_DEFINITIONS "DISTRHO_PLUGIN_TARGET_VST"
-              OUTPUT_NAME "ZynAddSubFX"
-              PREFIX ""
-              LINK_FLAGS "-static-libgcc -static-libstdc++")
-          target_link_libraries(ZynAddSubFX_vst zynaddsubfx_core ${OS_LIBRARIES} ${LIBLO_LIBRARIES})
-          EOF
+          cd $HOME/deps
+          curl -fLO https://www.fltk.org/pub/fltk/1.3.9/fltk-1.3.9-source.tar.gz
+          tar xzf fltk-1.3.9-source.tar.gz && cd fltk-1.3.9
+          ./configure --prefix=/mingw32 --disable-gl
+          make -j4 && make install
+      - name: Unpack source
+        run: |
+          # psed = sed -i that prints a visible warning when a patch changed nothing
+          psed() {
+            cp "$2" "$2.orig"
+            sed -i "$1" "$2"
+            if cmp -s "$2" "$2.orig"; then echo "::warning::PATCH DID NOT APPLY: $2 :: $1"; fi
+            rm -f "$2.orig"
+          }
+          tar xjf zynaddsubfx-3.0.3-bluegreen-theme.tar.bz2
+          cd zynaddsubfx-3.0.3
+          psed 's|COMMAND ${FLTK_CONFIG} --use-images --ldflags|COMMAND sh ${FLTK_CONFIG} --use-images --ldflags|' src/CMakeLists.txt
+          psed 's|string(STRIP ${FLTK_LDFLAGS} FLTK_LIBRARIES)|if(NOT FLTK_LDFLAGS)\n\t\t\tset(FLTK_LDFLAGS "-mwindows -lfltk_images -lfltk_png -lfltk_z -lfltk_jpeg -lfltk -lole32 -luuid -lcomctl32 -lwsock32 -lm -lgdi32 -lcomdlg32")\n\t\tendif()\n\t\tstring(STRIP "${FLTK_LDFLAGS}" FLTK_LIBRARIES)\n\t\tstring(REPLACE "-mwindows" "-mconsole" FLTK_LIBRARIES "${FLTK_LIBRARIES}")|' src/CMakeLists.txt
+          sed -n 363,375p src/CMakeLists.txt
+          psed 's|^fl_open_display();$|\\#ifndef _WIN32\nfl_open_display();\n\\#endif|' src/UI/MasterUI.fl
+          grep -n -B1 -A1 "fl_open_display" src/UI/MasterUI.fl
+          psed 's/\([^.>_a-zA-Z0-9]\)index(/\1strchr(/g' src/UI/Fl_Osc_Tree.H
+          grep -n "strchr(" src/UI/Fl_Osc_Tree.H
+          cat > src/crashreport.h <<'CRASHEOF'
+          #pragma once
+          #ifdef WIN32
+          #include <windows.h>
+          #include <dbghelp.h>
+          #include <stdio.h>
+          #include <string.h>
+          #include <io.h>
 
+          typedef BOOL    (WINAPI *zyn_SymInitialize_t)(HANDLE, const char *, BOOL);
+          typedef BOOL    (WINAPI *zyn_SymFromAddr_t)(HANDLE, DWORD64, DWORD64 *, SYMBOL_INFO *);
+          typedef BOOL    (WINAPI *zyn_StackWalk64_t)(DWORD, HANDLE, HANDLE, void *, void *,
+                                                      void *, void *, void *, void *);
+          typedef DWORD   (WINAPI *zyn_SymSetOptions_t)(DWORD);
+          typedef void *  (WINAPI *zyn_SymFunctionTableAccess64_t)(HANDLE, DWORD64);
+          typedef DWORD64 (WINAPI *zyn_SymGetModuleBase64_t)(HANDLE, DWORD64);
+
+          static CONTEXT       zyn_crash_ctx;
+          static unsigned long zyn_crash_base = 0;
+
+          /* runs on a fresh thread, because the crashed thread may have no stack left */
+          static DWORD WINAPI zyn_walk_thread(LPVOID param)
+          {
+              HANDLE thr = (HANDLE)param;
+              HMODULE dh = LoadLibraryA("dbghelp.dll");
+              if(!dh)
+                  return 0;
+              zyn_SymInitialize_t pSymInitialize = (zyn_SymInitialize_t)GetProcAddress(dh, "SymInitialize");
+              zyn_SymFromAddr_t pSymFromAddr = (zyn_SymFromAddr_t)GetProcAddress(dh, "SymFromAddr");
+              zyn_StackWalk64_t pStackWalk64 = (zyn_StackWalk64_t)GetProcAddress(dh, "StackWalk64");
+              zyn_SymSetOptions_t pSymSetOptions = (zyn_SymSetOptions_t)GetProcAddress(dh, "SymSetOptions");
+              zyn_SymFunctionTableAccess64_t pFuncTable =
+                  (zyn_SymFunctionTableAccess64_t)GetProcAddress(dh, "SymFunctionTableAccess64");
+              zyn_SymGetModuleBase64_t pModBase =
+                  (zyn_SymGetModuleBase64_t)GetProcAddress(dh, "SymGetModuleBase64");
+              if(!(pSymInitialize && pSymFromAddr && pStackWalk64 && pFuncTable && pModBase))
+                  return 0;
+              HANDLE proc = GetCurrentProcess();
+              if(pSymSetOptions)
+                  pSymSetOptions(0x2); /* SYMOPT_UNDNAME */
+              pSymInitialize(proc, NULL, TRUE);
+              CONTEXT ctx = zyn_crash_ctx;
+              STACKFRAME64 frame;
+              memset(&frame, 0, sizeof(frame));
+              frame.AddrPC.Offset    = ctx.Eip;
+              frame.AddrPC.Mode      = AddrModeFlat;
+              frame.AddrFrame.Offset = ctx.Ebp;
+              frame.AddrFrame.Mode   = AddrModeFlat;
+              frame.AddrStack.Offset = ctx.Esp;
+              frame.AddrStack.Mode   = AddrModeFlat;
+              for(int i = 0; i < 30; i++) {
+                  if(!pStackWalk64(0x14c, proc, thr, &frame, &ctx, NULL,
+                                   (void *)pFuncTable, (void *)pModBase, NULL))
+                      break;
+                  if(frame.AddrPC.Offset == 0)
+                      break;
+                  union { SYMBOL_INFO s; char pad[sizeof(SYMBOL_INFO) + 300]; } u;
+                  memset(&u, 0, sizeof(u));
+                  u.s.SizeOfStruct = sizeof(SYMBOL_INFO);
+                  u.s.MaxNameLen   = 299;
+                  DWORD64 disp = 0;
+                  unsigned long pc = (unsigned long)frame.AddrPC.Offset;
+                  if(pSymFromAddr(proc, frame.AddrPC.Offset, &disp, &u.s))
+                      fprintf(stderr, "[CRASH]  #%d %s +0x%lX (0x%08lX)\n",
+                              i, u.s.Name, (unsigned long)disp, pc);
+                  else
+                      fprintf(stderr, "[CRASH]  #%d 0x%08lX (offset 0x%lX)\n", i, pc, pc - zyn_crash_base);
+              }
+              fflush(stderr);
+              return 0;
+          }
+
+          static LONG WINAPI zyn_crash_handler(EXCEPTION_POINTERS *ep)
+          {
+              unsigned long base = (unsigned long)GetModuleHandle(NULL);
+              unsigned long addr = (unsigned long)ep->ExceptionRecord->ExceptionAddress;
+              zyn_crash_base = base;
+              zyn_crash_ctx  = *ep->ContextRecord;
+              fprintf(stderr, "\n[CRASH] exception code 0x%08lX at 0x%08lX (exe base 0x%08lX)\n",
+                      (unsigned long)ep->ExceptionRecord->ExceptionCode, addr, base);
+              fflush(stderr);
+              HANDLE self = NULL;
+              DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+                              &self, 0, FALSE, DUPLICATE_SAME_ACCESS);
+              HANDLE t = CreateThread(NULL, 0, zyn_walk_thread, (LPVOID)self, 0, NULL);
+              if(t)
+                  WaitForSingleObject(t, 30000);
+              fflush(stderr);
+              return EXCEPTION_EXECUTE_HANDLER;
+          }
+          /* write everything the program prints (stdout and stderr) into a log file next to the exe,
+             so the text is still there after a crash closes the console window */
+          static void zyn_open_log(const char *name)
+          {
+              char path[MAX_PATH + 32];
+              memset(path, 0, sizeof(path));
+              GetModuleFileNameA(NULL, path, MAX_PATH);
+              char *slash = strrchr(path, '\\');
+              if(slash)
+                  slash[1] = '\0';
+              else
+                  path[0] = '\0';
+              strcat(path, name);
+              if(freopen(path, "w", stdout)) {
+                  setvbuf(stdout, NULL, _IONBF, 0);
+                  _dup2(_fileno(stdout), _fileno(stderr));
+                  setvbuf(stderr, NULL, _IONBF, 0);
+              }
+          }
+          #endif
+          CRASHEOF
+          psed 's|^GUI::ui_handle_t gui;$|#include "crashreport.h"\nGUI::ui_handle_t gui;|' src/main.cpp
+          psed 's|^    int noui = 0;$|    int noui = 0;\n#ifdef WIN32\n    SetUnhandledExceptionFilter(zyn_crash_handler);\n    zyn_open_log("zyn-log.txt");\n#endif|' src/main.cpp
+          grep -n "crashreport\|zyn_crash_handler" src/main.cpp
+          psed '0,/uToB->write("\/freeze_state","");/s|uToB->write("/freeze_state","");|&\n    fprintf(stderr, "[SAVE] asking backend to freeze\\n");|' src/Misc/MiddleWare.cpp
+          psed '0,/assert(tries < 10000);/s|assert(tries < 10000);|fprintf(stderr, "[SAVE] wait finished after %d tries (10000 = backend never answered)\\n", tries);\n    assert(tries < 10000);|' src/Misc/MiddleWare.cpp
+          psed 's|^\( *\)int res = master->part\[npart\]->saveXML(fname.c_str());|\1fprintf(stderr, "[SAVE] writing file: %s\\n", fname.c_str());\n\1int res = master->part[npart]->saveXML(fname.c_str());\n\1fprintf(stderr, "[SAVE] write finished, result %d\\n", res);|' src/Misc/MiddleWare.cpp
+          grep -n "\[SAVE\]" src/Misc/MiddleWare.cpp
+          psed 's|^filename=fl_file_chooser("Save:","({\*.xiz})",NULL,0);$|&\nfprintf(stderr, "[SAVE] UI: chooser returned\\\\n");|' src/UI/MasterUI.fl
+          psed 's|^filename=fl_filename_setext(filename,".xiz");$|&\nfprintf(stderr, "[SAVE] UI: file name is %s\\\\n", filename);|' src/UI/MasterUI.fl
+          psed 's|^osc->write("/save_xiz", "is", npart, filename);$|fprintf(stderr, "[SAVE] UI: sending save request\\\\n");\n&\nfprintf(stderr, "[SAVE] UI: request sent\\\\n");|' src/UI/MasterUI.fl
+          grep -n "\[SAVE\] UI" src/UI/MasterUI.fl
+          cat > DPF/distrho/src/zyn_vst_editor.h <<'VSTEOF'
+          #ifndef ZYN_VST_EDITOR_H_INCLUDED
+          #define ZYN_VST_EDITOR_H_INCLUDED
+
+          #if DISTRHO_OS_WINDOWS
+
+          #ifndef WIN32_LEAN_AND_MEAN
+          # define WIN32_LEAN_AND_MEAN
+          #endif
+          #include <windows.h>
+          #include <stdio.h>
+          #include <string.h>
+
+          static void zyn_editor_anchor() {}
+
+          static HMODULE zyn_this_module()
+          {
+              HMODULE hm = NULL;
+              GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                 (LPCSTR)&zyn_editor_anchor, &hm);
+              return hm;
+          }
+
+          static LRESULT CALLBACK zyn_panel_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+          {
+              switch(m) {
+              case WM_ERASEBKGND: {
+                  RECT r;
+                  GetClientRect(h, &r);
+                  HBRUSH b = CreateSolidBrush(RGB(14, 18, 24));
+                  FillRect((HDC)w, &r, b);
+                  DeleteObject(b);
+                  return 1;
+              }
+              case WM_PAINT: {
+                  PAINTSTRUCT ps;
+                  HDC dc = BeginPaint(h, &ps);
+                  SetBkMode(dc, TRANSPARENT);
+                  SetTextColor(dc, RGB(0, 230, 120));
+                  const char *t1 = "ZynAddSubFX editor";
+                  const char *t2 = "The editor opens in its own window.";
+                  const char *t3 = "Close this panel to close the editor.";
+                  TextOutA(dc, 12, 12, t1, (int)strlen(t1));
+                  TextOutA(dc, 12, 40, t2, (int)strlen(t2));
+                  TextOutA(dc, 12, 64, t3, (int)strlen(t3));
+                  EndPaint(h, &ps);
+                  return 0;
+              }
+              }
+              return DefWindowProcA(h, m, w, l);
+          }
+
+          class ZynExtEditor
+          {
+          public:
+              ZynExtEditor() : fHwnd(NULL), fProc(NULL)
+              {
+                  fRect.top    = 0;
+                  fRect.left   = 0;
+                  fRect.bottom = 525;
+                  fRect.right  = 390;
+              }
+
+              ~ZynExtEditor()
+              {
+                  close();
+              }
+
+              ERect *rect()
+              {
+                  return &fRect;
+              }
+
+              void open(void *parent, int oscPort)
+              {
+                  close();
+
+                  HMODULE mod = zyn_this_module();
+
+                  WNDCLASSA wc;
+                  memset(&wc, 0, sizeof(wc));
+                  wc.lpfnWndProc   = zyn_panel_proc;
+                  wc.hInstance     = (HINSTANCE)mod;
+                  wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+                  wc.lpszClassName = "ZynRemotePanel";
+                  RegisterClassA(&wc); // fails harmlessly if it already exists
+
+                  fHwnd = CreateWindowExA(0, "ZynRemotePanel", "", WS_CHILD | WS_VISIBLE,
+                                          0, 0, 390, 525, (HWND)parent, NULL, (HINSTANCE)mod, NULL);
+
+                  launch(mod, oscPort);
+              }
+
+              void close()
+              {
+                  if(fProc) {
+                      TerminateProcess(fProc, 0);
+                      WaitForSingleObject(fProc, 1000);
+                      CloseHandle(fProc);
+                      fProc = NULL;
+                  }
+                  if(fHwnd) {
+                      DestroyWindow(fHwnd);
+                      fHwnd = NULL;
+                      UnregisterClassA("ZynRemotePanel", (HINSTANCE)zyn_this_module()); // fails harmlessly if another instance still uses it
+                  }
+              }
+
+          private:
+              HWND   fHwnd;
+              HANDLE fProc;
+              ERect  fRect;
+
+              void launch(HMODULE mod, int oscPort)
+              {
+                  char dir[MAX_PATH + 4];
+                  memset(dir, 0, sizeof(dir));
+                  GetModuleFileNameA(mod, dir, MAX_PATH);
+                  char *slash = strrchr(dir, '\\');
+                  if(slash)
+                      slash[1] = '\0';
+                  else
+                      dir[0] = '\0';
+
+                  char exe[MAX_PATH + 64];
+                  snprintf(exe, sizeof(exe), "%szynaddsubfx-ext-gui.exe", dir);
+
+                  char cmd[2 * MAX_PATH + 160];
+                  snprintf(cmd, sizeof(cmd), "\"%s\" --title \"ZynAddSubFX\" osc.udp://localhost:%d/",
+                           exe, oscPort);
+
+                  STARTUPINFOA si;
+                  memset(&si, 0, sizeof(si));
+                  si.cb = sizeof(si);
+                  PROCESS_INFORMATION pi;
+                  memset(&pi, 0, sizeof(pi));
+
+                  if(CreateProcessA(exe, cmd, NULL, NULL, FALSE, 0x08000000 /* CREATE_NO_WINDOW */, NULL, dir[0] ? dir : NULL, &si, &pi)) {
+                      fProc = pi.hProcess;
+                      CloseHandle(pi.hThread);
+                  } else {
+                      MessageBoxA(NULL, "Could not start zynaddsubfx-ext-gui.exe.\nIt must be in the same folder as the plugin file.",
+                                  "ZynAddSubFX", MB_OK);
+                  }
+              }
+          };
+
+          #endif // DISTRHO_OS_WINDOWS
+          #endif // ZYN_VST_EDITOR_H_INCLUDED
+          VSTEOF
+          python3 - <<'PYEOF'
+          p = 'DPF/distrho/src/DistrhoPluginVST.cpp'
+          s = open(p).read()
+          def rep(old, new):
+              global s
+              assert old in s, 'anchor not found: ' + old[:40]
+              s = s.replace(old, new, 1)
+          rep('\nSTART_NAMESPACE_DISTRHO\n', '\n#include "zyn_vst_editor.h"\n\nSTART_NAMESPACE_DISTRHO\n')
+          rep('#if DISTRHO_PLUGIN_WANT_STATE\n        case effGetChunk:', '''#if DISTRHO_OS_WINDOWS && ! DISTRHO_PLUGIN_HAS_UI
+                  case effEditGetRect:
+                      *(ERect**)ptr = zynEditor.rect();
+                      return 1;
+
+                  case effEditOpen:
+                      zynEditor.open(ptr, int(fPlugin.getParameterValue(kParamOscPort) + 0.5f));
+                      return 1;
+
+                  case effEditClose:
+                      zynEditor.close();
+                      return 1;
+          #endif
+
+          #if DISTRHO_PLUGIN_WANT_STATE
+                  case effGetChunk:''')
+          rep('    // UI stuff\n#if DISTRHO_PLUGIN_HAS_UI\n    UIVst* fVstUI;', '    // UI stuff\n#if DISTRHO_OS_WINDOWS && ! DISTRHO_PLUGIN_HAS_UI\n    ZynExtEditor zynEditor;\n#endif\n#if DISTRHO_PLUGIN_HAS_UI\n    UIVst* fVstUI;')
+          rep('#if DISTRHO_PLUGIN_HAS_UI\n    effect->flags |= effFlagsHasEditor;\n#endif', '#if DISTRHO_PLUGIN_HAS_UI || DISTRHO_OS_WINDOWS\n    effect->flags |= effFlagsHasEditor;\n#endif')
+          open(p, 'w').write(s)
+          print('vst editor patch applied')
+          PYEOF
+          python3 - <<'PYEOF2'
+          # native Windows save dialog (FLTK's own chooser crashes on save here)
+          p = 'src/UI/MasterUI.fl'
+          s = open(p).read()
+          anchor = 'decl {\\#include "WidgetPDial.h"} {public local\n} \n'
+          assert anchor in s, 'WidgetPDial anchor not found'
+          helper = r'''decl {\#include <FL/Fl_File_Chooser.H>} {private local
+          } 
+
+          decl {\#include <FL/Fl_Native_File_Chooser.H>} {private local
+          } 
+
+          decl {char *zyn_file_chooser(const char *message, const char *pattern, const char *fname, int relative)
+          {
+              if(strncmp(message, "Save", 4) && strncmp(message, "Record", 6) && strncmp(message, "Export", 6))
+                  return (fl_file_chooser)(message, pattern, fname, relative);
+
+              static char zyn_chosen[1024];
+              char filter[256];
+              int n = 0;
+              for(const char *p = pattern; *p && n < 240; ) {
+                  if(p[0] == 42 && p[1] == 46) { /* "*." */
+                      if(n)
+                          filter[n++] = 59; /* ; */
+                      while(*p && *p != 44 && *p != 125 && *p != 41 && n < 240) /* comma, closing brace, closing parenthesis */
+                          filter[n++] = *p++;
+                  } else
+                      p++;
+              }
+              filter[n] = 0;
+
+              char spec[300];
+              snprintf(spec, sizeof(spec), "Files\\t%s", filter);
+
+              Fl_Native_File_Chooser nfc;
+              nfc.title(message);
+              nfc.type(Fl_Native_File_Chooser::BROWSE_SAVE_FILE);
+              nfc.filter(spec);
+              nfc.options(Fl_Native_File_Chooser::SAVEAS_CONFIRM);
+              if(nfc.show() != 0)
+                  return NULL;
+              strncpy(zyn_chosen, nfc.filename(), sizeof(zyn_chosen) - 1);
+              zyn_chosen[sizeof(zyn_chosen) - 1] = 0;
+              return zyn_chosen;
+          }} {private local
+          } 
+
+          decl {\#define fl_file_chooser(m,p,f,r) zyn_file_chooser(m,p,f,r)} {private local
+          } 
+
+          '''
+          s = s.replace(anchor, helper + anchor, 1)
+          open(p, 'w').write(s)
+
+          # editor program: no console spam, log to file, crash report
+          p = 'src/UI/guimain.cpp'
+          s = open(p).read()
+          old = 'fprintf(stdout, "renameLink('
+          assert old in s, 'renameLink print not found'
+          s = s.replace(old, 'if(0) fprintf(stdout, "renameLink(', 1)
+          old = '#ifndef CARLA_VERSION_STRING\nint main(int argc, char *argv[])\n{\n'
+          assert old in s, 'ext-gui main not found'
+          s = s.replace(old, '#include "../crashreport.h"\n' + old + '#ifdef WIN32\n    SetUnhandledExceptionFilter(zyn_crash_handler);\n    zyn_open_log("zyn-gui-log.txt");\n#endif\n', 1)
+          open(p, 'w').write(s)
+          print('ui patches applied')
+          PYEOF2
+          psed 's|o->color( FL_CYAN );|o->color( fl_rgb_color(12, 52, 40) );|' src/UI/guimain.cpp
+          psed 's|^    Fl::add_handler(kb_shortcut_handler);$|    Fl::background(14, 18, 24);\n    Fl::background2(22, 30, 40);\n    Fl::foreground(215, 240, 230);\n    Fl::set_color(FL_SELECTION_COLOR, 0, 200, 110);\n    Fl::add_handler(kb_shortcut_handler);|' src/UI/guimain.cpp
+          psed 's|pdialcolor(10, 14, 20);|pdialcolor(6, 24, 14);|; s|fl_color(20, 90, 160);|fl_color(30, 150, 80);|; s|pdialcolor(25, 35, 48);|pdialcolor(16, 84, 48);|; s|pdialcolor(12, 18, 26);|pdialcolor(22, 110, 64);|; s|pdialcolor(80, 170, 255);|pdialcolor(200, 255, 220);|' src/UI/WidgetPDial.cpp
+          grep -n "fl_rgb_color(12\|Fl::background(14" src/UI/guimain.cpp
+          grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
+          psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
+          sed -n 715,730p src/main.cpp
       - name: Configure
         run: |
-          mkdir -p build
-          cd build
-          cmake -G Ninja .. \
-            -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
-            -DGuiModule=fltk \
-            -DPaEnable=ON \
-            -DDefaultOutput=portaudio \
-            -DDefaultInput=null
-
-      - name: Build
+          cd zynaddsubfx-3.0.3
+          mkdir build && cd build
+          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_CXX_FLAGS="-include cstdint -g -fno-omit-frame-pointer -mstackrealign" \
+            -DCMAKE_C_FLAGS="-g -fno-omit-frame-pointer -mstackrealign" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+            -DGuiModule=fltk -DPaEnable=ON \
+            -DJackEnable=OFF -DAlsaEnable=OFF -DOssEnable=OFF
+      - name: Build standalone exe
         run: |
-          cd build
-          ninja -j2 -v
-
-      - name: Collect exe and DLLs
+          cd zynaddsubfx-3.0.3/build
+          set +e
+          ninja -k 0 zynaddsubfx > ../../build.log 2>&1
+          STATUS=$?
+          echo "================ ERROR SUMMARY (scroll here) ================"
+          grep -n -E "error:|FAILED:|undefined reference|fatal error" ../../build.log | head -40
+          echo "================ LAST 15 LINES ================"
+          tail -n 15 ../../build.log
+          echo "ninja exit code: $STATUS"
+          exit $STATUS
+      - name: Build VST (optional)
+        continue-on-error: true
         run: |
-          mkdir -p dist
-          EXE=$(find build -name 'zynaddsubfx.exe' | head -n 1)
-          echo "Found: $EXE"
-          cp "$EXE" dist/
-          ldd "$EXE" | grep -i '/mingw32/' | awk '{print $3}' | xargs -I{} cp {} dist/
-          ls -la dist
-
-      - name: Collect VST dll
+          cd zynaddsubfx-3.0.3/build
+          set +e
+          ninja -k 0 ZynAddSubFX_vst zynaddsubfx-ext-gui > ../../build-vst.log 2>&1
+          STATUS=$?
+          echo "================ VST ERROR SUMMARY ================"
+          grep -n -E "error:|FAILED:|undefined reference|fatal error" ../../build-vst.log | head -40
+          echo "================ LAST 15 LINES ================"
+          tail -n 15 ../../build-vst.log
+          echo "ninja exit code: $STATUS"
+          exit $STATUS
+      - name: Collect files
         run: |
-          mkdir -p dist-vst
-          DLL=$(find build -name 'ZynAddSubFX.dll' | head -n 1)
-          echo "Found: $DLL"
-          cp "$DLL" dist-vst/
-          ldd "$DLL" | grep -i '/mingw32/' | awk '{print $3}' | xargs -I{} cp {} dist-vst/ || true
-          ls -la dist-vst
-
-      - name: Upload standalone
-        uses: actions/upload-artifact@v4
+          mkdir -p out
+          # copy every non-system DLL a file needs (and what those DLLs need)
+          copydeps() {
+            local file="$1" dest="$2"
+            for dll in $(objdump -p "$file" | grep "DLL Name" | awk '{print $3}'); do
+              if [ -f "/mingw32/bin/$dll" ] && [ ! -f "$dest/$dll" ]; then
+                cp "/mingw32/bin/$dll" "$dest/"
+                echo "bundled $dll"
+                copydeps "/mingw32/bin/$dll" "$dest"
+              fi
+            done
+          }
+          EXE=$(find zynaddsubfx-3.0.3/build -name zynaddsubfx.exe | head -n 1)
+          cp "$EXE" out/
+          copydeps out/zynaddsubfx.exe out
+          VST=$(find zynaddsubfx-3.0.3/build -name ZynAddSubFX.dll | head -n 1)
+          if [ -n "$VST" ]; then
+            mkdir -p out/vst
+            cp "$VST" out/vst/
+            copydeps out/vst/ZynAddSubFX.dll out/vst
+          fi
+          GUIEXE=$(find zynaddsubfx-3.0.3/build -name zynaddsubfx-ext-gui.exe | head -n 1)
+          if [ -n "$VST" ] && [ -n "$GUIEXE" ]; then
+            cp "$GUIEXE" out/vst/
+            copydeps out/vst/zynaddsubfx-ext-gui.exe out/vst
+          fi
+          cp -r zynaddsubfx-3.0.3/instruments out/ || true
+          cp -r zynaddsubfx-3.0.3/pixmaps out/ || true
+          # keep unstripped copies for addr2line, ship stripped ones
+          mkdir -p debug
+          cp out/zynaddsubfx.exe debug/ 2>/dev/null || true
+          cp out/vst/ZynAddSubFX.dll debug/ 2>/dev/null || true
+          cp out/vst/zynaddsubfx-ext-gui.exe debug/ 2>/dev/null || true
+          strip --strip-unneeded out/zynaddsubfx.exe 2>/dev/null || true
+          strip --strip-unneeded out/vst/ZynAddSubFX.dll 2>/dev/null || true
+          strip --strip-unneeded out/vst/zynaddsubfx-ext-gui.exe 2>/dev/null || true
+          (cd debug && zip -r ../zyn-debug-symbols.zip . ) || true
+          echo "===== FILES IN ZIP ====="
+          ls -R out | head -n 60
+          cd out && zip -r ../zynaddsubfx-win32.zip .
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: zynaddsubfx-win32
-          path: dist/
-
-      - name: Upload VST
-        uses: actions/upload-artifact@v4
+          path: zynaddsubfx-win32.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: zynaddsubfx-vst-win32
-          path: dist-vst/
+          name: zyn-debug-symbols
+          path: zyn-debug-symbols.zip
+          if-no-files-found: ignore
