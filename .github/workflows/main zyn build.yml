@@ -435,4 +435,540 @@ jobs:
                   return NULL;
               strncpy(zyn_chosen, nfc.filename(), sizeof(zyn_chosen) - 1);
               zyn_chosen[sizeof(zyn_chosen) - 1] = 0;
-              r
+              return zyn_chosen;
+          }} {private local
+          } 
+
+          decl {\#define fl_file_chooser(m,p,f,r) zyn_file_chooser(m,p,f,r)} {private local
+          } 
+
+          '''
+          s = s.replace(anchor, helper + anchor, 1)
+          open(p, 'w').write(s)
+
+          # editor program: no console spam, log to file, crash report
+          p = 'src/UI/guimain.cpp'
+          s = open(p).read()
+          old = 'fprintf(stdout, "renameLink('
+          assert old in s, 'renameLink print not found'
+          s = s.replace(old, 'if(0) fprintf(stdout, "renameLink(', 1)
+          old = '#ifndef CARLA_VERSION_STRING\nint main(int argc, char *argv[])\n{\n'
+          assert old in s, 'ext-gui main not found'
+          s = s.replace(old, '#include "../crashreport.h"\n' + old + '#ifdef WIN32\n    SetUnhandledExceptionFilter(zyn_crash_handler);\n    zyn_open_log("zyn-gui-log.txt");\n#endif\n', 1)
+          open(p, 'w').write(s)
+          print('ui patches applied')
+          PYEOF2
+          psed 's|o->color( FL_CYAN );|o->color( fl_rgb_color(12, 52, 40) );|' src/UI/guimain.cpp
+          psed 's|^    Fl::add_handler(kb_shortcut_handler);$|    Fl::background(14, 18, 24);\n    Fl::background2(22, 30, 40);\n    Fl::foreground(215, 240, 230);\n    Fl::set_color(FL_SELECTION_COLOR, 0, 200, 110);\n    Fl::add_handler(kb_shortcut_handler);|' src/UI/guimain.cpp
+          psed 's|pdialcolor(10, 14, 20);|pdialcolor(6, 24, 14);|; s|fl_color(20, 90, 160);|fl_color(30, 150, 80);|; s|pdialcolor(25, 35, 48);|pdialcolor(16, 84, 48);|; s|pdialcolor(12, 18, 26);|pdialcolor(22, 110, 64);|; s|pdialcolor(80, 170, 255);|pdialcolor(200, 255, 220);|' src/UI/WidgetPDial.cpp
+          grep -n "fl_rgb_color(12\|Fl::background(14" src/UI/guimain.cpp
+          grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
+          psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
+          sed -n 715,730p src/main.cpp
+      - name: Apply unified UI (stage 2 - engines inside the window)
+        run: |
+          cd zynaddsubfx-3.0.3
+          cat > src/UI/UnifiedShell.h <<'HEOF'
+          // UnifiedShell.h - single-window layout, stage 2
+          #pragma once
+          class MasterUI;
+          class Fl_Window;
+          void zyn_unified_shell(MasterUI *ui);
+          // put an engine editor window inside the ENGINES tab (slot 0 = ADD global,
+          // 1 = ADD voice, 2 = SUB, 3 = PAD); falls back to a normal popup window
+          void zyn_embed_engine(Fl_Window *w, int slot);
+          HEOF
+          cat > src/UI/UnifiedShell.cpp <<'CPPEOF'
+          // UnifiedShell.cpp - stage 2 of the single-window UI.
+          // 1316x912 window, top bar with logo + tabs, ENGINES tab that holds the
+          // ADD / SUB / PAD editors inside the window, FX / MATRIX / GLOBAL pages,
+          // envelope strip placeholder and a full-width keyboard.
+          // Set the environment variable ZYN_CLASSIC_UI=1 to keep the old layout.
+          #include "UnifiedShell.h"
+          #include "MasterUI.h"
+          #include "PartUI.h"
+          #include "Fl_Osc_Pane.H"
+          #include <FL/Fl.H>
+          #include <FL/Fl_Box.H>
+          #include <FL/Fl_Button.H>
+          #include <FL/Fl_Group.H>
+          #include <FL/Fl_Menu_Bar.H>
+          #include <FL/Fl_Tabs.H>
+          #include <FL/Fl_Window.H>
+          #include <FL/fl_draw.H>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <vector>
+
+          namespace {
+
+          const int WIN_W = 1316, WIN_H = 912;
+          const int MENU_H = 25, TAB_H = 40, SEL_H = 34, KB_H = 56;
+          const int STRIP_H = 96, PAD = 8;
+          const int SLOT1_X = PAD + 540 + PAD;   // ADD voice window sits right of the ADD global window
+
+          Fl_Group  *g_pages[4]  = {0, 0, 0, 0};
+          Fl_Button *g_tabs[4]   = {0, 0, 0, 0};
+          Fl_Button *g_engbtn[3] = {0, 0, 0};
+          Fl_Group  *g_engine    = 0;
+          int        g_engine_y  = 0;
+          MasterUI  *g_ui        = 0;
+
+          // The page that holds the engine editor windows. The editors are owned by
+          // PartUI (it deletes them itself), so on destruction we only DETACH them
+          // here, otherwise they would be deleted twice.
+          class EnginePage : public Fl_Group
+          {
+          public:
+              EnginePage(int x, int y, int w, int h) : Fl_Group(x, y, w, h) {}
+              ~EnginePage()
+              {
+                  g_engine = 0;
+                  for(int i = children() - 1; i >= 0; --i) {
+                      Fl_Window *c = dynamic_cast<Fl_Window *>(child(i));
+                      if(c) {
+                          c->hide();
+                          remove(i);
+                      }
+                  }
+              }
+          };
+
+          void show_page(int n)
+          {
+              for(int i = 0; i < 4; ++i) {
+                  if(g_pages[i]) {
+                      if(i == n)
+                          g_pages[i]->show();
+                      else
+                          g_pages[i]->hide();
+                  }
+                  if(g_tabs[i])
+                      g_tabs[i]->value(i == n ? 1 : 0);
+              }
+              if(g_pages[n] && g_pages[n]->window())
+                  g_pages[n]->window()->redraw();
+          }
+
+          void tab_cb(Fl_Widget *, void *d)
+          {
+              show_page((int)(intptr_t)d);
+          }
+
+          void eng_cb(Fl_Widget *, void *d)
+          {
+              if(g_ui && g_ui->partui)
+                  g_ui->partui->showparameters(0, (int)(intptr_t)d);
+          }
+
+          void instr_cb(Fl_Widget *, void *)
+          {
+              if(g_ui && g_ui->partui && g_ui->partui->instrumenteditwindow)
+                  g_ui->partui->instrumenteditwindow->show();
+          }
+
+          Fl_Group *make_page(int y, int h, bool engine)
+          {
+              Fl_Group *g = engine ? new EnginePage(0, y, WIN_W, h) : new Fl_Group(0, y, WIN_W, h);
+              g->box(FL_FLAT_BOX);
+              g->color(fl_rgb_color(14, 18, 24));
+              g->end();
+              return g;
+          }
+
+          Fl_Box *note(Fl_Group *page, int x, int y, int w, int h, const char *text)
+          {
+              page->begin();
+              Fl_Box *b = new Fl_Box(x, y, w, h, text);
+              b->box(FL_FLAT_BOX);
+              b->color(fl_rgb_color(22, 30, 40));
+              b->labelcolor(fl_rgb_color(143, 167, 176));
+              b->labelsize(12);
+              b->align(FL_ALIGN_CENTER | FL_ALIGN_WRAP);
+              page->end();
+              return b;
+          }
+
+          void move_into(Fl_Group *page, Fl_Widget *w, int x, int y)
+          {
+              if(!w)
+                  return;
+              page->add(w);
+              w->position(x, y);
+          }
+
+          } // namespace
+
+          void zyn_embed_engine(Fl_Window *w, int slot)
+          {
+              if(!w)
+                  return;
+              if(!g_engine) {            // classic layout: behave like before
+                  w->show();
+                  return;
+              }
+              if(w->parent() != g_engine) {
+                  w->hide();
+                  if(w->parent())
+                      w->parent()->remove(w);
+                  g_engine->add(w);
+              }
+              w->position(slot == 1 ? SLOT1_X : PAD, g_engine_y);
+
+              // hide the other engine editors (keep the ADD global window next to the ADD voice window)
+              for(int i = 0; i < g_engine->children(); ++i) {
+                  Fl_Window *c = dynamic_cast<Fl_Window *>(g_engine->child(i));
+                  if(!c || c == w)
+                      continue;
+                  if(slot == 1 && c->x() == PAD)
+                      continue;
+                  c->hide();
+              }
+              w->show();
+
+              int b = (slot == 2) ? 1 : (slot == 3) ? 2 : 0;
+              for(int i = 0; i < 3; ++i)
+                  if(g_engbtn[i])
+                      g_engbtn[i]->value(i == b ? 1 : 0);
+              g_engine->redraw();
+          }
+
+          void zyn_unified_shell(MasterUI *ui)
+          {
+              static bool done = false;
+              if(done)
+                  return;
+              done = true;
+
+              if(getenv("ZYN_CLASSIC_UI"))
+                  return;
+              if(!ui || !ui->masterwindow || !ui->win_root ||
+                 !ui->partuigroup || !ui->syseffectuigroup)
+                  return;
+              g_ui = ui;
+
+              Fl_Window *win = ui->masterwindow;
+
+              Fl_Tabs *fxtabs = 0;
+              if(ui->syseffectuigroup->parent() && ui->syseffectuigroup->parent()->parent())
+                  fxtabs = dynamic_cast<Fl_Tabs *>(ui->syseffectuigroup->parent()->parent());
+
+              std::vector<Fl_Widget *> master_widgets;
+              Fl_Menu_Bar *menu = 0;
+              for(int i = 0; i < ui->win_root->children(); ++i) {
+                  Fl_Widget *c = ui->win_root->child(i);
+                  if(!menu) {
+                      if(Fl_Menu_Bar *m = dynamic_cast<Fl_Menu_Bar *>(c)) {
+                          menu = m;
+                          continue;
+                      }
+                  }
+                  if(c == ui->partuigroup || c == fxtabs)
+                      continue;
+                  if(c->w() <= 30 && c->h() <= 30 && (!c->label() || !c->label()[0]))
+                      continue;
+                  master_widgets.push_back(c);
+              }
+
+              win->resizable(NULL);
+              ui->win_root->resizable(NULL);
+              win->size(WIN_W, WIN_H);
+              ui->win_root->resize(0, 0, WIN_W, WIN_H);
+              if(menu)
+                  menu->resize(0, 0, WIN_W, MENU_H);
+
+              const int bar_y   = MENU_H;
+              const int page_y  = MENU_H + TAB_H;
+              const int kb_y    = WIN_H - KB_H - PAD;
+              const int strip_y = kb_y - STRIP_H - PAD;
+              const int page_h  = strip_y - PAD - page_y;
+              g_engine_y = page_y + SEL_H + 6;
+
+              win->begin();
+
+              Fl_Box *bar = new Fl_Box(0, bar_y, WIN_W, TAB_H);
+              bar->box(FL_FLAT_BOX);
+              bar->color(fl_rgb_color(10, 14, 19));
+
+              Fl_Box *logo = new Fl_Box(16, bar_y + 4, 200, TAB_H - 8, "ZYNADDSUBFX");
+              logo->box(FL_NO_BOX);
+              logo->labelcolor(fl_rgb_color(0, 215, 120));
+              logo->labelfont(FL_HELVETICA_BOLD);
+              logo->labelsize(18);
+              logo->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
+
+              static const char *names[4] = {"ENGINES", "FX", "MATRIX", "GLOBAL"};
+              for(int i = 0; i < 4; ++i) {
+                  Fl_Button *b = new Fl_Button(250 + i * 116, bar_y + 4, 110, TAB_H - 8, names[i]);
+                  b->type(FL_RADIO_BUTTON);
+                  b->box(FL_FLAT_BOX);
+                  b->down_box(FL_FLAT_BOX);
+                  b->color(fl_rgb_color(10, 14, 19));
+                  b->selection_color(fl_rgb_color(0, 128, 76));
+                  b->labelcolor(fl_rgb_color(215, 240, 230));
+                  b->labelfont(FL_HELVETICA_BOLD);
+                  b->labelsize(14);
+                  b->clear_visible_focus();
+                  b->callback(tab_cb, (void *)(intptr_t)i);
+                  g_tabs[i] = b;
+              }
+
+              for(int i = 0; i < 4; ++i)
+                  g_pages[i] = make_page(page_y, page_h, i == 0);
+              g_engine = g_pages[0];
+
+              Fl_Box *strip = new Fl_Box(PAD, strip_y, WIN_W - 2 * PAD, STRIP_H,
+                                         "ENVELOPE EDITOR\nThe envelope graph will show here (click E on a section) - next stage");
+              strip->box(FL_FLAT_BOX);
+              strip->color(fl_rgb_color(22, 30, 40));
+              strip->labelcolor(fl_rgb_color(143, 167, 176));
+              strip->labelsize(12);
+
+              VirKeys *kb = new VirKeys(PAD, kb_y, WIN_W - 2 * PAD, KB_H, "Keyboard");
+              kb->box(FL_BORDER_BOX);
+              kb->color(17);
+              kb->init(ui->osc, "/");
+
+              win->end();
+
+              // ENGINES page: engine selector row + a hint where the editors will appear
+              static const char *engnames[3] = {"ADD SYNTH", "SUB SYNTH", "PAD SYNTH"};
+              g_pages[0]->begin();
+              for(int i = 0; i < 3; ++i) {
+                  Fl_Button *b = new Fl_Button(PAD + i * 158, page_y + 2, 152, SEL_H, engnames[i]);
+                  b->type(FL_RADIO_BUTTON);
+                  b->box(FL_FLAT_BOX);
+                  b->down_box(FL_FLAT_BOX);
+                  b->color(fl_rgb_color(22, 30, 40));
+                  b->selection_color(fl_rgb_color(0, 128, 76));
+                  b->labelcolor(fl_rgb_color(215, 240, 230));
+                  b->labelfont(FL_HELVETICA_BOLD);
+                  b->labelsize(14);
+                  b->clear_visible_focus();
+                  b->callback(eng_cb, (void *)(intptr_t)i);
+                  g_engbtn[i] = b;
+              }
+              Fl_Button *ib = new Fl_Button(WIN_W - PAD - 190, page_y + 2, 190, SEL_H, "Instrument Edit (enable engines)");
+              ib->box(FL_FLAT_BOX);
+              ib->color(fl_rgb_color(22, 30, 40));
+              ib->labelcolor(fl_rgb_color(215, 240, 230));
+              ib->labelsize(12);
+              ib->clear_visible_focus();
+              ib->callback(instr_cb);
+              g_pages[0]->end();
+              note(g_pages[0], PAD, g_engine_y, WIN_W - 2 * PAD, 200,
+                   "ENGINES\n\nPress ADD SYNTH, SUB SYNTH or PAD SYNTH to open that editor inside this window.\n"
+                   "Use 'Instrument Edit' to switch engines on or off.");
+
+              // FX page: existing effect tabs, placeholder for the editor
+              if(fxtabs)
+                  move_into(g_pages[1], fxtabs, PAD, page_y + PAD);
+              const int nx = PAD + 390 + PAD;
+              note(g_pages[1], nx, page_y + PAD, WIN_W - nx - PAD, 165,
+                   "FX\n\nSystem and insertion effects are on the left.\nA single effect rack and editor comes in the next stage.");
+              note(g_pages[2], PAD, page_y + PAD, WIN_W - 2 * PAD, 120,
+                   "MATRIX\n\nKit edit and the ADD voice list will live here (next stage).");
+
+              // GLOBAL page: master controls (left) and the part panel (right of them)
+              for(size_t i = 0; i < master_widgets.size(); ++i) {
+                  Fl_Widget *w = master_widgets[i];
+                  g_pages[3]->add(w);
+                  w->position(w->x() + PAD, w->y() - MENU_H + page_y + PAD);
+              }
+              move_into(g_pages[3], ui->partuigroup, nx, page_y + PAD);
+
+              show_page(0);
+              win->redraw();
+          }
+          CPPEOF
+          python3 - <<'PYEOF'
+          def patch(path, old, new):
+              s = open(path).read()
+              assert s.count(old) == 1, (path, old[:70], s.count(old))
+              open(path, 'w').write(s.replace(old, new))
+          patch('src/UI/CMakeLists.txt', '        NioUI.cpp\n', '        NioUI.cpp\n        UnifiedShell.cpp\n')
+          patch('src/UI/MasterUI.fl', 'decl {\\#include "NioUI.h"} {public global',
+                'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "NioUI.h"} {public global')
+          patch('src/UI/MasterUI.fl', 'swapefftype=0;\nsimplerefresh();} {}',
+                'swapefftype=0;\nsimplerefresh();\nzyn_unified_shell(this);} {}')
+          # stage 2: show the engine editors inside the ENGINES tab
+          patch('src/UI/PartUI.fl', 'decl {\\#include "ADnoteUI.h"} {public local',
+                'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "ADnoteUI.h"} {public local')
+          patch('src/UI/PartUI.fl', 'if (engine==0&&adnoteui) adnoteui->ADnoteGlobalParameters->show();',
+                'if (engine==0&&adnoteui) { zyn_embed_engine(adnoteui->ADnoteGlobalParameters,0); showvoiceparams(kititem,false); }')
+          patch('src/UI/PartUI.fl', 'if (engine==1&&subnoteui) subnoteui->SUBparameters->show();',
+                'if (engine==1&&subnoteui) zyn_embed_engine(subnoteui->SUBparameters,2);')
+          patch('src/UI/PartUI.fl', 'if (engine==2&&padnoteui) padnoteui->padnotewindow->show();}',
+                'if (engine==2&&padnoteui) zyn_embed_engine(padnoteui->padnotewindow,3);}')
+          patch('src/UI/PartUI.fl', 'adnoteui->ADnoteVoice->show();\n    }}}',
+                'zyn_embed_engine(adnoteui->ADnoteVoice,1);\n    }}}')
+          print('unified ui stage 2 patches applied')
+          PYEOF
+
+      - name: Crash diagnostics (abort hook and exit markers)
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def patch(path, old, new):
+              s = open(path).read()
+              assert s.count(old) == 1, (path, old[:60], s.count(old))
+              open(path, 'w').write(s.replace(old, new))
+          HOOKS = r'''
+          /* abort() and uncaught C++ exceptions do not raise a normal crash, so hook them too */
+          static void zyn_report_stack(const char *why)
+          {
+              void *frames[40];
+              USHORT n = RtlCaptureStackBackTrace(0, 40, frames, NULL);
+              fprintf(stderr, "\n[ABORT] %s\n", why);
+              for(USHORT i = 0; i < n; i++) {
+                  HMODULE m = NULL;
+                  char name[MAX_PATH];
+                  name[0] = '\0';
+                  if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                        (LPCSTR)frames[i], &m) && m)
+                      GetModuleFileNameA(m, name, MAX_PATH);
+                  const char *base = strrchr(name, '\\');
+                  base = base ? base + 1 : name;
+                  fprintf(stderr, "[ABORT]  #%u %s +0x%lX (0x%08lX)\n", (unsigned)i, base,
+                          (unsigned long)((char *)frames[i] - (char *)m), (unsigned long)frames[i]);
+              }
+              fflush(stderr);
+          }
+          static void zyn_on_sigabrt(int)
+          {
+              signal(SIGABRT, SIG_DFL);
+              zyn_report_stack("abort() was called");
+              raise(SIGABRT);
+          }
+          static void zyn_on_terminate()
+          {
+              std::exception_ptr p = std::current_exception();
+              if(p) {
+                  try { std::rethrow_exception(p); }
+                  catch(const std::exception &e) { fprintf(stderr, "\n[ABORT] uncaught C++ exception: %s\n", e.what()); }
+                  catch(...) { fprintf(stderr, "\n[ABORT] uncaught C++ exception of unknown type\n"); }
+              }
+              zyn_report_stack("std::terminate");
+              signal(SIGABRT, SIG_DFL);
+              abort();
+          }
+          static void zyn_install_abort_hooks(void)
+          {
+              signal(SIGABRT, zyn_on_sigabrt);
+              std::set_terminate(zyn_on_terminate);
+          }
+          '''[1:]
+          EXIT_OLD = '    Nio::stop();\n    config.save();\n    middleware->removeAutoSave();\n\n    GUI::destroyUi(gui);\n    delete middleware;\n'
+          EXIT_NEW = r'''
+              fprintf(stderr, "[EXIT] begin\n");
+              Nio::stop();
+              fprintf(stderr, "[EXIT] audio stopped\n");
+              config.save();
+              fprintf(stderr, "[EXIT] config saved\n");
+              middleware->removeAutoSave();
+
+              GUI::destroyUi(gui);
+              fprintf(stderr, "[EXIT] UI destroyed\n");
+              delete middleware;
+              fprintf(stderr, "[EXIT] middleware deleted\n");
+          '''[1:]
+          patch('src/crashreport.h', '#include <io.h>\n', '#include <io.h>\n#include <signal.h>\n#include <exception>\n')
+          patch('src/crashreport.h', '/* write everything the program prints', HOOKS + '/* write everything the program prints')
+          patch('src/main.cpp', 'zyn_open_log("zyn-log.txt");', 'zyn_open_log("zyn-log.txt");\n    zyn_install_abort_hooks();')
+          patch('src/UI/guimain.cpp', 'zyn_open_log("zyn-gui-log.txt");', 'zyn_open_log("zyn-gui-log.txt");\n    zyn_install_abort_hooks();')
+          patch('src/main.cpp', EXIT_OLD, EXIT_NEW)
+          print('crash diagnostics applied')
+          PYEOF
+
+      - name: Configure
+        run: |
+          cd zynaddsubfx-3.0.3
+          mkdir build && cd build
+          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_CXX_FLAGS="-include cstdint -g -fno-omit-frame-pointer -mstackrealign" \
+            -DCMAKE_C_FLAGS="-g -fno-omit-frame-pointer -mstackrealign" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+            -DGuiModule=fltk -DPaEnable=ON \
+            -DJackEnable=OFF -DAlsaEnable=OFF -DOssEnable=OFF
+      - name: Build standalone exe
+        run: |
+          cd zynaddsubfx-3.0.3/build
+          set +e
+          ninja -k 0 zynaddsubfx > ../../build.log 2>&1
+          STATUS=$?
+          echo "================ ERROR SUMMARY (scroll here) ================"
+          grep -n -E "error:|FAILED:|undefined reference|fatal error" ../../build.log | head -40
+          echo "================ LAST 15 LINES ================"
+          tail -n 15 ../../build.log
+          echo "ninja exit code: $STATUS"
+          exit $STATUS
+      - name: Build VST (optional)
+        continue-on-error: true
+        run: |
+          cd zynaddsubfx-3.0.3/build
+          set +e
+          ninja -k 0 ZynAddSubFX_vst zynaddsubfx-ext-gui > ../../build-vst.log 2>&1
+          STATUS=$?
+          echo "================ VST ERROR SUMMARY ================"
+          grep -n -E "error:|FAILED:|undefined reference|fatal error" ../../build-vst.log | head -40
+          echo "================ LAST 15 LINES ================"
+          tail -n 15 ../../build-vst.log
+          echo "ninja exit code: $STATUS"
+          exit $STATUS
+      - name: Collect files
+        run: |
+          mkdir -p out
+          # copy every non-system DLL a file needs (and what those DLLs need)
+          copydeps() {
+            local file="$1" dest="$2"
+            for dll in $(objdump -p "$file" | grep "DLL Name" | awk '{print $3}'); do
+              if [ -f "/mingw32/bin/$dll" ] && [ ! -f "$dest/$dll" ]; then
+                cp "/mingw32/bin/$dll" "$dest/"
+                echo "bundled $dll"
+                copydeps "/mingw32/bin/$dll" "$dest"
+              fi
+            done
+          }
+          EXE=$(find zynaddsubfx-3.0.3/build -name zynaddsubfx.exe | head -n 1)
+          cp "$EXE" out/
+          copydeps out/zynaddsubfx.exe out
+          VST=$(find zynaddsubfx-3.0.3/build -name ZynAddSubFX.dll | head -n 1)
+          if [ -n "$VST" ]; then
+            mkdir -p out/vst
+            cp "$VST" out/vst/
+            copydeps out/vst/ZynAddSubFX.dll out/vst
+          fi
+          GUIEXE=$(find zynaddsubfx-3.0.3/build -name zynaddsubfx-ext-gui.exe | head -n 1)
+          if [ -n "$VST" ] && [ -n "$GUIEXE" ]; then
+            cp "$GUIEXE" out/vst/
+            copydeps out/vst/zynaddsubfx-ext-gui.exe out/vst
+          fi
+          cp -r zynaddsubfx-3.0.3/instruments out/ || true
+          cp -r zynaddsubfx-3.0.3/pixmaps out/ || true
+          # keep unstripped copies for addr2line, ship stripped ones
+          mkdir -p debug
+          cp out/zynaddsubfx.exe debug/ 2>/dev/null || true
+          cp out/vst/ZynAddSubFX.dll debug/ 2>/dev/null || true
+          cp out/vst/zynaddsubfx-ext-gui.exe debug/ 2>/dev/null || true
+          strip --strip-unneeded out/zynaddsubfx.exe 2>/dev/null || true
+          strip --strip-unneeded out/vst/ZynAddSubFX.dll 2>/dev/null || true
+          strip --strip-unneeded out/vst/zynaddsubfx-ext-gui.exe 2>/dev/null || true
+          (cd debug && zip -r ../zyn-debug-symbols.zip . ) || true
+          echo "===== FILES IN ZIP ====="
+          ls -R out | head -n 60
+          cd out && zip -r ../zynaddsubfx-win32.zip .
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zynaddsubfx-win32
+          path: zynaddsubfx-win32.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zyn-debug-symbols
+          path: zyn-debug-symbols.zip
+          if-no-files-found: ignore
