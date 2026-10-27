@@ -465,18 +465,21 @@ jobs:
           grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
           psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
           sed -n 715,730p src/main.cpp
-      - name: Apply unified UI (stage 2b - adaptive, engines inside the window)
+      - name: Apply unified UI (stage 2c - adaptive, engines inside the window)
         run: |
           cd zynaddsubfx-3.0.3
           cat > src/UI/UnifiedShell.h <<'HEOF'
-          // UnifiedShell.h - single-window layout, stage 2b
+          // UnifiedShell.h - single-window layout, stage 2c
           #pragma once
           class MasterUI;
           class Fl_Window;
           void zyn_unified_shell(MasterUI *ui);
-          // put an engine editor window inside the ENGINES tab (slot 0 = ADD global,
-          // 1 = ADD voice, 2 = SUB, 3 = PAD); falls back to a normal popup window
+          // show an engine editor inside the ENGINES tab (slot 0 = ADD global, 1 = ADD voice, 2 = SUB, 3 = PAD)
           void zyn_embed_engine(Fl_Window *w, int slot);
+          // show the kit list (slot 0) or the ADD voice list (slot 1) inside the MATRIX tab
+          void zyn_embed_matrix(Fl_Window *w, int slot);
+          // "Edit instrument": go to the ENGINES tab (or show the old window on small screens)
+          void zyn_goto_engines(Fl_Window *fallback);
           HEOF
           cat > src/UI/UnifiedShell.cpp <<'CPPEOF'
           // UnifiedShell.cpp - stage 2 of the single-window UI (adaptive).
@@ -488,9 +491,11 @@ jobs:
           #include "MasterUI.h"
           #include "PartUI.h"
           #include "Fl_Osc_Pane.H"
+          #include "Fl_Osc_Check.H"
           #include <FL/Fl.H>
           #include <FL/Fl_Box.H>
           #include <FL/Fl_Button.H>
+          #include <FL/Fl_Check_Button.H>
           #include <FL/Fl_Group.H>
           #include <FL/Fl_Menu_Bar.H>
           #include <FL/Fl_Tabs.H>
@@ -512,9 +517,15 @@ jobs:
           Fl_Group  *g_pages[4]  = {0, 0, 0, 0};
           Fl_Button *g_tabs[4]   = {0, 0, 0, 0};
           Fl_Button *g_engbtn[3] = {0, 0, 0};
+          Fl_Check_Button *g_engon[3] = {0, 0, 0};   // "engine on" ticks next to the engine buttons
           Fl_Group  *g_engine    = 0;     // only set in BIG mode
           int        g_engine_y  = 0;
+          Fl_Group  *g_matrix    = 0;     // MATRIX page, only set in BIG mode
+          int        g_matrix_y  = 0;
           MasterUI  *g_ui        = 0;
+
+          void sync_cb(void *);
+          void open_later_cb(void *);
 
           // Holds the engine editor windows. They are owned by PartUI (which deletes
           // them itself), so on destruction we only DETACH them here.
@@ -525,6 +536,10 @@ jobs:
               ~EnginePage()
               {
                   g_engine = 0;
+                  g_matrix = 0;
+                  g_ui = 0;
+                  Fl::remove_timeout(sync_cb);
+                  Fl::remove_timeout(open_later_cb);
                   for(int i = children() - 1; i >= 0; --i) {
                       Fl_Window *c = dynamic_cast<Fl_Window *>(child(i));
                       if(c) {
@@ -534,6 +549,9 @@ jobs:
                   }
               }
           };
+
+          void show_page(int n);
+          void prepare_matrix();
 
           void show_page(int n)
           {
@@ -554,12 +572,70 @@ jobs:
           void tab_cb(Fl_Widget *, void *d)
           {
               show_page((int)(intptr_t)d);
+              if((int)(intptr_t)d == 2)
+                  prepare_matrix();
           }
 
-          void eng_cb(Fl_Widget *, void *d)
+          // the "enabled" tick of an engine (ADD = 0, SUB = 1, PAD = 2) in the Instrument Edit panel
+          Fl_Check_Button *engine_check(int engine)
+          {
+              if(!g_ui || !g_ui->partui)
+                  return 0;
+              PartUI *p = g_ui->partui;
+              if(engine == 0)
+                  return p->adsynenabledcheck;
+              if(engine == 1)
+                  return p->subsynenabledcheck;
+              return p->padsynenabledcheck;
+          }
+
+          void open_later_cb(void *d)
           {
               if(g_ui && g_ui->partui)
                   g_ui->partui->showparameters(0, (int)(intptr_t)d);
+          }
+
+          // The backend only creates the SUB / PAD parameters when that engine is enabled.
+          // Opening an editor for a disabled engine makes it talk to parameters that do
+          // not exist (this crashed the PAD editor), so enable the engine first and open
+          // the editor a moment later, once the backend has created the parameters.
+          void eng_cb(Fl_Widget *, void *d)
+          {
+              const int engine = (int)(intptr_t)d;
+              if(!g_ui || !g_ui->partui)
+                  return;
+              Fl_Check_Button *chk = engine_check(engine);
+              if(chk && !chk->value()) {
+                  chk->value(1);
+                  chk->do_callback();
+                  Fl::remove_timeout(open_later_cb, d);
+                  Fl::add_timeout(0.5, open_later_cb, d);
+                  return;
+              }
+              g_ui->partui->showparameters(0, engine);
+          }
+
+          // tick next to an engine name: switch the engine on or off
+          void engon_cb(Fl_Widget *w, void *d)
+          {
+              Fl_Check_Button *chk = engine_check((int)(intptr_t)d);
+              if(!chk)
+                  return;
+              chk->value(((Fl_Check_Button *)w)->value());
+              chk->do_callback();
+          }
+
+          // keep our ticks in step with the real engine state
+          void sync_cb(void *)
+          {
+              for(int i = 0; i < 3; ++i) {
+                  Fl_Check_Button *chk = engine_check(i);
+                  if(chk && g_engon[i] && g_engon[i]->value() != chk->value()) {
+                      g_engon[i]->value(chk->value());
+                      g_engon[i]->redraw();
+                  }
+              }
+              Fl::repeat_timeout(0.3, sync_cb);
           }
 
           void instr_cb(Fl_Widget *, void *)
@@ -598,7 +674,45 @@ jobs:
               w->position(x, y);
           }
 
+          void prepare_matrix()
+          {
+              if(!g_matrix || !g_ui || !g_ui->partui)
+                  return;
+              if(g_ui->partui->instrumentkitlist)
+                  zyn_embed_matrix(g_ui->partui->instrumentkitlist, 0);   // kit edit
+              g_ui->partui->showvoiceparams(0, true);                     // ADD voice list
+          }
+
           } // namespace
+
+          // kit list (slot 0) and ADD voice list (slot 1) live in the MATRIX tab
+          void zyn_embed_matrix(Fl_Window *w, int slot)
+          {
+              if(!w)
+                  return;
+              if(!g_matrix) {            // small screen / classic layout: normal popup window
+                  w->show();
+                  return;
+              }
+              if(w->parent() != g_matrix) {
+                  w->hide();
+                  if(w->parent())
+                      w->parent()->remove(w);
+                  g_matrix->add(w);
+              }
+              w->position(slot == 1 ? PAD + 670 + PAD : PAD, g_matrix_y);
+              w->show();
+              show_page(2);
+          }
+
+          // "Edit instrument" button of the part panel
+          void zyn_goto_engines(Fl_Window *fallback)
+          {
+              if(g_engine)
+                  show_page(0);
+              else if(fallback)
+                  fallback->show();
+          }
 
           void zyn_embed_engine(Fl_Window *w, int slot)
           {
@@ -650,8 +764,8 @@ jobs:
 
               // pick the layout from the screen size
               bool big = false;
+              int sx = 0, sy = 0, sw = 0, sh = 0;
               {
-                  int sx = 0, sy = 0, sw = 0, sh = 0;
                   Fl::screen_work_area(sx, sy, sw, sh);
                   big = (sw >= 1350 && sh >= 950);
                   const char *force = getenv("ZYN_UI_SIZE");
@@ -662,7 +776,7 @@ jobs:
                   fprintf(stderr, "[UI] work area %dx%d -> %s layout\n", sw, sh, big ? "BIG" : "SMALL");
               }
               if(big) {
-                  WIN_W = 1330;
+                  WIN_W = 1366;
                   WIN_H = 912;
               }
 
@@ -692,6 +806,11 @@ jobs:
               win->resizable(NULL);
               ui->win_root->resizable(NULL);
               win->size(WIN_W, WIN_H);
+              if(sw > 0 && sh > 0) {   // open centered, so the keyboard at the bottom stays on screen
+                  int px = sx + (sw - WIN_W) / 2;
+                  int py = sy + (sh - WIN_H - 40) / 2;   // ~40 px for the title bar and frame
+                  win->position(px < sx ? sx : px, py < sy ? sy : py);
+              }
               ui->win_root->resize(0, 0, WIN_W, WIN_H);
               if(menu)
                   menu->resize(0, 0, WIN_W, MENU_H);
@@ -733,8 +852,10 @@ jobs:
               }
 
               for(int i = 0; i < 4; ++i)
-                  g_pages[i] = make_page(page_y, page_h, big && i == 0);
+                  g_pages[i] = make_page(page_y, page_h, big && (i == 0 || i == 2));
               g_engine = big ? g_pages[0] : 0;
+              g_matrix = big ? g_pages[2] : 0;
+              g_matrix_y = page_y + PAD;
 
               Fl_Box *strip = new Fl_Box(PAD, strip_y, WIN_W - 2 * PAD, STRIP_H,
                                          "ENVELOPE EDITOR\nThe envelope graph will show here (click E on a section) - next stage");
@@ -757,7 +878,7 @@ jobs:
                   static const char *engnames[3] = {"ADD SYNTH", "SUB SYNTH", "PAD SYNTH"};
                   g_pages[0]->begin();
                   for(int i = 0; i < 3; ++i) {
-                      Fl_Button *b = new Fl_Button(PAD + i * 158, page_y + 2, 152, SEL_H, engnames[i]);
+                      Fl_Button *b = new Fl_Button(PAD + i * 158, page_y + 2, 118, SEL_H, engnames[i]);
                       b->type(FL_RADIO_BUTTON);
                       b->box(FL_FLAT_BOX);
                       b->down_box(FL_FLAT_BOX);
@@ -769,9 +890,18 @@ jobs:
                       b->clear_visible_focus();
                       b->callback(eng_cb, (void *)(intptr_t)i);
                       g_engbtn[i] = b;
+
+                      Fl_Check_Button *on = new Fl_Check_Button(PAD + i * 158 + 122, page_y + 2, 30, SEL_H);
+                      on->box(FL_FLAT_BOX);
+                      on->color(fl_rgb_color(22, 30, 40));
+                      on->selection_color(fl_rgb_color(0, 200, 110));
+                      on->tooltip("Engine on / off");
+                      on->clear_visible_focus();
+                      on->callback(engon_cb, (void *)(intptr_t)i);
+                      g_engon[i] = on;
                   }
                   Fl_Button *ib = new Fl_Button(WIN_W - PAD - 190, page_y + 2, 190, SEL_H,
-                                                "Instrument Edit (enable engines)");
+                                                "Instrument info / Part FX");
                   ib->box(FL_FLAT_BOX);
                   ib->color(fl_rgb_color(22, 30, 40));
                   ib->labelcolor(fl_rgb_color(215, 240, 230));
@@ -781,7 +911,7 @@ jobs:
                   g_pages[0]->end();
                   note(g_pages[0], PAD, g_engine_y, WIN_W - 2 * PAD, 200,
                        "ENGINES\n\nPress ADD SYNTH, SUB SYNTH or PAD SYNTH to open that editor inside this window.\n"
-                       "Use 'Instrument Edit' to switch engines on or off.");
+                       "An engine that is off is switched on automatically. The tick next to each name turns it on or off.");
                   // GLOBAL: part panel next to the master controls
                   move_into(g_pages[3], ui->partuigroup, nx, page_y + PAD);
               } else {
@@ -800,8 +930,10 @@ jobs:
                   move_into(g_pages[1], fxtabs, PAD, page_y + PAD);
               note(g_pages[1], nx, page_y + PAD, WIN_W - nx - PAD, 165,
                    "FX\n\nSystem and insertion effects are on the left.\nA single effect rack and editor comes in the next stage.");
-              note(g_pages[2], PAD, page_y + PAD, WIN_W - 2 * PAD, 120,
-                   "MATRIX\n\nKit edit and the ADD voice list will live here (next stage).");
+              if(!big)
+                  note(g_pages[2], PAD, page_y + PAD, WIN_W - 2 * PAD, 120,
+                       "MATRIX\n\nKit edit and the ADD voice list open as separate windows on small screens\n"
+                       "(use Edit instrument with Shift held for the kit list).");
 
               // GLOBAL: master controls keep their arrangement
               for(size_t i = 0; i < master_widgets.size(); ++i) {
@@ -809,6 +941,9 @@ jobs:
                   g_pages[3]->add(w);
                   w->position(w->x() + PAD, w->y() - MENU_H + page_y + PAD);
               }
+
+              if(big)
+                  Fl::add_timeout(0.3, sync_cb);
 
               show_page(0);
               win->redraw();
@@ -840,7 +975,18 @@ jobs:
                 'decl {\\#define SIZE_WHITE ((w() >= (N_OCT*7+1)) ? (w()/(N_OCT*7+1)) : 14)} {private local')
           patch('src/UI/VirKeyboard.fl', 'decl {static const int SIZE_BLACK=8;} {private local',
                 'decl {\\#define SIZE_BLACK (SIZE_WHITE*4/7)} {private local')
-          print('unified ui stage 2b patches applied')
+          # stage 2c: kit list + voice list go to the MATRIX tab, Edit instrument goes to ENGINES
+          patch('src/UI/PartUI.fl', 'adnoteui->ADnoteVoiceList->show();', 'zyn_embed_matrix(adnoteui->ADnoteVoiceList,1);')
+          patch('src/UI/PartUI.fl',
+                '          if (Fl::event_shift() || Fl::event_ctrl())\n              instrumentkitlist->show();\n          else\n              instrumenteditwindow->show();',
+                '          if (Fl::event_shift() || Fl::event_ctrl())\n              zyn_embed_matrix(instrumentkitlist,0);\n          else\n              zyn_goto_engines(instrumenteditwindow);')
+          patch('src/UI/PartUI.fl', 'callback {instrumentkitlist->show();}', 'callback {zyn_embed_matrix(instrumentkitlist,0);}')
+          patch('src/UI/ADnoteUI.fl', 'decl {\\#include "ResonanceUI.h"} {public local',
+                'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "ResonanceUI.h"} {public local')
+          patch('src/UI/ADnoteUI.fl', 'voicelistitem[i]->refreshlist();\n}\nADnoteVoiceList->show();}',
+                'voicelistitem[i]->refreshlist();\n}\nzyn_embed_matrix(ADnoteVoiceList,1);}')
+          patch('src/UI/ADnoteUI.fl', '          ADnoteVoiceList->show();\n', '          zyn_embed_matrix(ADnoteVoiceList,1);\n')
+          print('unified ui stage 2c patches applied')
           PYEOF
 
       - name: Crash diagnostics (abort hook and exit markers)
@@ -985,14 +1131,14 @@ jobs:
           fi
           cp -r zynaddsubfx-3.0.3/instruments out/ || true
           cp -r zynaddsubfx-3.0.3/pixmaps out/ || true
-          # keep unstripped copies for addr2line, ship stripped ones
+          # keep unstripped copies for addr2line; shipped files keep their symbol table so crash logs show function names
           mkdir -p debug
           cp out/zynaddsubfx.exe debug/ 2>/dev/null || true
           cp out/vst/ZynAddSubFX.dll debug/ 2>/dev/null || true
           cp out/vst/zynaddsubfx-ext-gui.exe debug/ 2>/dev/null || true
-          strip --strip-unneeded out/zynaddsubfx.exe 2>/dev/null || true
-          strip --strip-unneeded out/vst/ZynAddSubFX.dll 2>/dev/null || true
-          strip --strip-unneeded out/vst/zynaddsubfx-ext-gui.exe 2>/dev/null || true
+          strip --strip-debug out/zynaddsubfx.exe 2>/dev/null || true
+          strip --strip-debug out/vst/ZynAddSubFX.dll 2>/dev/null || true
+          strip --strip-debug out/vst/zynaddsubfx-ext-gui.exe 2>/dev/null || true
           (cd debug && zip -r ../zyn-debug-symbols.zip . ) || true
           echo "===== FILES IN ZIP ====="
           ls -R out | head -n 60
