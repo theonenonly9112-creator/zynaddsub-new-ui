@@ -1242,6 +1242,228 @@ jobs:
           print('crash diagnostics applied')
           PYEOF
 
+      - name: Stage 4 (oscillator and resonance tabs, no cmd window, no firewall prompt)
+        run: |
+          cd zynaddsubfx-3.0.3
+          cat > src/zyn_loopback.h <<'LBEOF'
+          #pragma once
+          #include <lo/lo.h>
+          /* OSC server that only listens on this computer (127.0.0.1).
+             Listening on every network interface is what makes Windows Firewall ask
+             "allow ZynAddSubFX to access the network?". If the loopback version cannot be
+             created the normal server is used instead. */
+          static inline lo_server zyn_lo_server_loopback(const char *port, lo_err_handler eh)
+          {
+              lo_server s = lo_server_new_multicast_iface(NULL, port, NULL, "127.0.0.1", eh);
+              if(!s)
+                  s = lo_server_new_with_proto(port, LO_UDP, eh);
+              return s;
+          }
+          LBEOF
+          python3 - <<'PYEOF'
+          import re
+
+          def rd(p):
+              return open(p).read()
+
+          def wr(p, s):
+              open(p, 'w').write(s)
+
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # ---------------------------------------------------------------- no cmd window
+          cm = 'src/CMakeLists.txt'
+          s = rd(cm)
+          s, c = re.subn(r'[ \t]*string\(REPLACE "-mwindows" "-mconsole" FLTK_LIBRARIES "\$\{FLTK_LIBRARIES\}"\)\n', '', s)
+          assert c == 1, ('mconsole line', c)
+          wr(cm, s)
+
+          # ---------------------------------------------------------------- no firewall question
+          mw = 'src/Misc/MiddleWare.cpp'
+          s = rd(mw)
+          s, c1 = re.subn(r'lo_server_new_with_proto\(to_s\(preferrred_port\)\.c_str\(\),\s*LO_UDP, liblo_error_cb\)',
+                          'zyn_lo_server_loopback(to_s(preferrred_port).c_str(), liblo_error_cb)', s)
+          s, c2 = re.subn(r'lo_server_new_with_proto\(NULL, LO_UDP, liblo_error_cb\)',
+                          'zyn_lo_server_loopback(NULL, liblo_error_cb)', s)
+          assert c1 == 1 and c2 == 1, ('middleware servers', c1, c2)
+          wr(mw, '#include "../zyn_loopback.h"\n' + s)
+
+          gm = 'src/UI/guimain.cpp'
+          s = rd(gm)
+          s, c = re.subn(r'lo_server_new_with_proto\(NULL, LO_UDP, liblo_error_cb\)',
+                         'zyn_lo_server_loopback(NULL, liblo_error_cb)', s)
+          assert c == 1, ('gui server', c)
+          wr(gm, '#include "../zyn_loopback.h"\n' + s)
+
+          # ---------------------------------------------------------------- oscillator / resonance tabs
+          H = 'src/UI/UnifiedShell.h'
+          C = 'src/UI/UnifiedShell.cpp'
+          sub1(H, 'void zyn_embed_fx(Fl_Window *w);',
+               'void zyn_embed_fx(Fl_Window *w);\n'
+               '// oscillator editor / resonance editor: shown as tabs of the ENGINES page\n'
+               'void zyn_embed_osc(Fl_Window *w);\n'
+               'void zyn_embed_res(Fl_Window *w);')
+
+          sub1(C, 'Fl_Button *g_engbtn[3] = {0, 0, 0};',
+               'Fl_Button *g_engbtn[5] = {0, 0, 0, 0, 0};   // ADD, SUB, PAD, OSCILLATOR, RESONANCE\n'
+               'Fl_Box    *g_engnote = 0;                  // text box of the ENGINES page (shows hints)')
+
+          sub1(C, '        g_engine = 0;\n        g_matrix = 0;\n',
+               '        g_engine = 0;\n        g_engnote = 0;\n        g_matrix = 0;\n')
+
+          sub1(C, '    int b = (slot == 2) ? 1 : (slot == 3) ? 2 : 0;\n    for(int i = 0; i < 3; ++i)\n        if(g_engbtn[i])',
+               '    dock_kind(w, 0);\n    int b = (slot == 2) ? 1 : (slot == 3) ? 2 : 0;\n    for(int i = 0; i < 5; ++i)\n        if(g_engbtn[i])')
+
+          BLOCK = r'''// ---- oscillator and resonance editors as tabs of the ENGINES page ----------
+          // kind of every window docked in ENGINES: 0 = engine editor, 3 = oscillator, 4 = resonance
+          struct DockKind
+          {
+              Fl_Window *w;
+              int        kind;
+          };
+          static std::vector<DockKind> g_dockkinds;
+
+          static void dock_kind(Fl_Window *w, int kind)
+          {
+              for(size_t i = 0; i < g_dockkinds.size(); ++i) {
+                  if(g_dockkinds[i].w == w) {
+                      g_dockkinds[i].kind = kind;
+                      return;
+                  }
+              }
+              DockKind k;
+              k.w = w;
+              k.kind = kind;
+              g_dockkinds.push_back(k);
+          }
+
+          // true when w is really one of the windows inside the ENGINES page (the owner may have deleted it)
+          static bool docked_here(Fl_Window *w)
+          {
+              if(!g_engine)
+                  return false;
+              for(int i = 0; i < g_engine->children(); ++i)
+                  if(g_engine->child(i) == w)
+                      return true;
+              return false;
+          }
+
+          static void mark_engine_tab(int index)
+          {
+              for(int i = 0; i < 5; ++i)
+                  if(g_engbtn[i])
+                      g_engbtn[i]->value(i == index ? 1 : 0);
+          }
+
+          static void embed_tool(Fl_Window *w, int kind)
+          {
+              if(!w)
+                  return;
+              if(!g_engine) {            // small screen / classic layout: normal popup window
+                  w->show();
+                  return;
+              }
+              if(w->parent() != g_engine) {
+                  w->hide();
+                  if(w->parent())
+                      w->parent()->remove(w);
+                  g_engine->add(w);
+              }
+              themify(w, 0);
+              dock_kind(w, kind);
+              w->position(PAD, g_engine_y);
+              for(int i = 0; i < g_engine->children(); ++i) {
+                  Fl_Window *c = dynamic_cast<Fl_Window *>(g_engine->child(i));
+                  if(c && c != w)
+                      c->hide();
+              }
+              w->show();
+              mark_engine_tab(kind);
+              g_engine->redraw();
+              show_page(0);
+          }
+
+          void zyn_embed_osc(Fl_Window *w)
+          {
+              embed_tool(w, 3);
+          }
+
+          void zyn_embed_res(Fl_Window *w)
+          {
+              embed_tool(w, 4);
+          }
+
+          // the OSCILLATOR / RESONANCE tab buttons
+          static void tool_tab_cb(Fl_Widget *, void *d)
+          {
+              const int kind = (int)(intptr_t)d;
+              if(!g_engine)
+                  return;
+              Fl_Window *found = 0;
+              for(size_t i = 0; i < g_dockkinds.size(); ++i)
+                  if(g_dockkinds[i].kind == kind && docked_here(g_dockkinds[i].w))
+                      found = g_dockkinds[i].w;
+              for(int i = 0; i < g_engine->children(); ++i) {
+                  Fl_Window *c = dynamic_cast<Fl_Window *>(g_engine->child(i));
+                  if(c && c != found)
+                      c->hide();
+              }
+              if(found)
+                  found->show();
+              else if(g_engnote) {
+                  if(kind == 3)
+                      g_engnote->label("OSCILLATOR\n\nNo oscillator editor is open yet.\n"
+                                       "Press 'Change' in the oscillator section of an ADD voice (or in the PAD synth)\n"
+                                       "and the editor appears here.");
+                  else
+                      g_engnote->label("RESONANCE\n\nNo resonance editor is open yet.\n"
+                                       "Press the 'Resonance' button of the ADD or PAD synth\n"
+                                       "and the editor appears here.");
+                  g_engnote->redraw();
+              }
+              mark_engine_tab(kind);
+              g_engine->redraw();
+          }
+
+          '''
+          sub1(C, 'void zyn_embed_engine(Fl_Window *w, int slot)\n{', BLOCK + 'void zyn_embed_engine(Fl_Window *w, int slot)\n{')
+
+          TABS = r'''        static const char *toolnames[2] = {"OSCILLATOR", "RESONANCE"};
+                  for(int i = 0; i < 2; ++i) {
+                      Fl_Button *tb = new Fl_Button(PAD + 3 * 158 + 30 + i * 128, page_y + 2, 118, SEL_H, toolnames[i]);
+                      tb->type(FL_RADIO_BUTTON);
+                      tb->box(FL_FLAT_BOX);
+                      tb->down_box(FL_FLAT_BOX);
+                      tb->color(fl_rgb_color(22, 30, 40));
+                      tb->selection_color(fl_rgb_color(0, 128, 76));
+                      tb->labelcolor(fl_rgb_color(215, 240, 230));
+                      tb->labelfont(FL_HELVETICA_BOLD);
+                      tb->labelsize(14);
+                      tb->clear_visible_focus();
+                      tb->callback(tool_tab_cb, (void *)(intptr_t)(3 + i));
+                      g_engbtn[3 + i] = tb;
+                  }
+          '''
+          sub1(C, '        Fl_Button *ib = new Fl_Button(WIN_W - PAD - 190, page_y + 2, 190, SEL_H,',
+               TABS + '        Fl_Button *ib = new Fl_Button(WIN_W - PAD - 190, page_y + 2, 190, SEL_H,')
+          sub1(C, '        note(g_pages[0], PAD, g_engine_y, WIN_W - 2 * PAD, 200,',
+               '        g_engnote = note(g_pages[0], PAD, g_engine_y, WIN_W - 2 * PAD, 200,')
+
+          # the editors dock themselves instead of opening a window
+          inc = 'decl {\\#include "ResonanceUI.h"} {public local'
+          inc_new = 'decl {\\#include "UnifiedShell.h"} {public local\n}\n\n' + inc
+          sub1('src/UI/OscilGenUI.fl', inc, inc_new)
+          sub1('src/UI/OscilGenUI.fl', 'refresh();\nosceditUI->show();} {}', 'refresh();\nzyn_embed_osc(osceditUI);} {}')
+          sub1('src/UI/PADnoteUI.fl', inc, inc_new)
+          sub1('src/UI/PADnoteUI.fl', 'resui->resonancewindow->show();', 'zyn_embed_res(resui->resonancewindow);')
+          sub1('src/UI/ADnoteUI.fl', 'resui->resonancewindow->show();}', 'zyn_embed_res(resui->resonancewindow);}')
+          print('stage 4 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
