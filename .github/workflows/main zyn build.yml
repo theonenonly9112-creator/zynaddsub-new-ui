@@ -465,11 +465,11 @@ jobs:
           grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
           psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
           sed -n 715,730p src/main.cpp
-      - name: Apply unified UI (stage 2d - move part controls to GLOBAL; preserve engine and FX code)
+      - name: Apply unified UI (stage 3 - adaptive, engines inside the window)
         run: |
           cd zynaddsubfx-3.0.3
           cat > src/UI/UnifiedShell.h <<'HEOF'
-          // UnifiedShell.h - single-window layout, stage 2d
+          // UnifiedShell.h - single-window layout, stage 3
           #pragma once
           class MasterUI;
           class Fl_Window;
@@ -480,9 +480,15 @@ jobs:
           void zyn_embed_matrix(Fl_Window *w, int slot);
           // "Edit instrument": go to the ENGINES tab (or show the old window on small screens)
           void zyn_goto_engines(Fl_Window *fallback);
+          // controllers / portamento panel -> GLOBAL tab
+          void zyn_embed_global(Fl_Window *w, int slot);
+          // the part's three insert effects -> FX tab
+          void zyn_embed_fx(Fl_Window *w);
+          // Close button of an embedded panel (does nothing when embedded)
+          void zyn_close_panel(Fl_Window *w);
           HEOF
           cat > src/UI/UnifiedShell.cpp <<'CPPEOF'
-          // UnifiedShell.cpp - stage 2d: incremental UI-only layout refinement.
+          // UnifiedShell.cpp - stage 3 of the single-window UI (adaptive).
           // BIG screens (work area >= 1350x950): 1330x912 window, the ADD / SUB / PAD
           // editors are shown INSIDE the ENGINES tab (ADD global + ADD voice side by side).
           // SMALL screens: 1000x680 window, editors still open as normal windows.
@@ -496,6 +502,12 @@ jobs:
           #include <FL/Fl_Box.H>
           #include <FL/Fl_Button.H>
           #include <FL/Fl_Check_Button.H>
+          #include <FL/Fl_Counter.H>
+          #include <FL/Fl_Input_.H>
+          #include <FL/Fl_Menu_.H>
+          #include <FL/Fl_Slider.H>
+          #include <FL/Fl_Value_Input.H>
+          #include <FL/Fl_Value_Slider.H>
           #include <FL/Fl_Group.H>
           #include <FL/Fl_Menu_Bar.H>
           #include <FL/Fl_Tabs.H>
@@ -522,6 +534,10 @@ jobs:
           int        g_engine_y  = 0;
           Fl_Group  *g_matrix    = 0;     // MATRIX page, only set in BIG mode
           int        g_matrix_y  = 0;
+          Fl_Group  *g_global    = 0;     // GLOBAL page (controllers / portamento panel)
+          Fl_Group  *g_fx        = 0;     // FX page (part effects panel)
+          int        g_ctl_x = 0, g_ctl_y = 0, g_fxp_x = 0, g_fxp_y = 0;
+          bool       g_theme     = true;
           MasterUI  *g_ui        = 0;
 
           void sync_cb(void *);
@@ -537,6 +553,8 @@ jobs:
               {
                   g_engine = 0;
                   g_matrix = 0;
+                  g_global = 0;
+                  g_fx = 0;
                   g_ui = 0;
                   Fl::remove_timeout(sync_cb);
                   Fl::remove_timeout(open_later_cb);
@@ -552,6 +570,90 @@ jobs:
 
           void show_page(int n);
           void prepare_matrix();
+
+          // ---- dark theme for the existing widgets (set ZYN_THEME=classic to turn it off) ----
+          const Fl_Color C_TEXT()  { return fl_rgb_color(205, 228, 220); }
+          const Fl_Color C_FIELD() { return fl_rgb_color(12, 16, 22); }
+
+          bool fill_box(Fl_Boxtype b)
+          {
+              return b == FL_FLAT_BOX || b == FL_UP_BOX || b == FL_DOWN_BOX || b == FL_THIN_UP_BOX ||
+                     b == FL_THIN_DOWN_BOX || b == FL_ENGRAVED_BOX || b == FL_EMBOSSED_BOX || b == FL_BORDER_BOX;
+          }
+
+          bool stock_gray(Fl_Color c)
+          {
+              return c >= 32 && c <= 55;   // FLTK gray ramp (includes the default background)
+          }
+
+          void themify(Fl_Widget *w, int depth)
+          {
+              if(!g_theme || !w)
+                  return;
+              Fl_Group *g = w->as_group();
+              if(g) {
+                  if(fill_box(w->box())) {
+                      w->box(FL_FLAT_BOX);
+                      w->color((depth & 1) ? fl_rgb_color(34, 44, 56) : fl_rgb_color(26, 34, 44));
+                  }
+                  w->labelcolor(C_TEXT());
+                  for(int i = 0; i < g->children(); ++i)
+                      themify(g->child(i), depth + 1);
+                  return;
+              }
+              w->labelcolor(C_TEXT());
+              if(Fl_Input_ *in = dynamic_cast<Fl_Input_ *>(w)) {
+                  in->color(C_FIELD());
+                  in->textcolor(C_TEXT());
+                  in->cursor_color(C_TEXT());
+              } else if(Fl_Menu_ *m = dynamic_cast<Fl_Menu_ *>(w)) {
+                  m->color(C_FIELD());
+                  m->textcolor(C_TEXT());
+              } else if(Fl_Counter *c = dynamic_cast<Fl_Counter *>(w)) {
+                  c->color(C_FIELD());
+                  c->textcolor(C_TEXT());
+              } else if(Fl_Value_Input *vi = dynamic_cast<Fl_Value_Input *>(w)) {
+                  vi->color(C_FIELD());
+                  vi->textcolor(C_TEXT());
+              } else if(Fl_Value_Slider *vs = dynamic_cast<Fl_Value_Slider *>(w)) {
+                  vs->textcolor(C_TEXT());
+                  if(stock_gray(vs->color()))
+                      vs->color(fl_rgb_color(50, 64, 80));
+              } else if(Fl_Slider *sl = dynamic_cast<Fl_Slider *>(w)) {
+                  if(stock_gray(sl->color()))
+                      sl->color(fl_rgb_color(50, 64, 80));
+              } else if(dynamic_cast<Fl_Button *>(w)) {
+                  if(fill_box(w->box()) && stock_gray(w->color()))
+                      w->color(fl_rgb_color(44, 58, 74));
+              }
+          }
+
+          Fl_Widget *find_by_label(Fl_Widget *w, const char *label)
+          {
+              if(!w)
+                  return 0;
+              if(w->label() && !strcmp(w->label(), label))
+                  return w;
+              if(Fl_Group *g = w->as_group())
+                  for(int i = 0; i < g->children(); ++i)
+                      if(Fl_Widget *r = find_by_label(g->child(i), label))
+                          return r;
+              return 0;
+          }
+
+          // move a (top-level) editor window into a page as a child window
+          void embed_into(Fl_Group *page, Fl_Window *w, int x, int y)
+          {
+              if(w->parent() != page) {
+                  w->hide();
+                  if(w->parent())
+                      w->parent()->remove(w);
+                  page->add(w);
+                  themify(w, 0);
+              }
+              w->position(x, y);
+              w->show();
+          }
 
           void show_page(int n)
           {
@@ -700,9 +802,43 @@ jobs:
                       w->parent()->remove(w);
                   g_matrix->add(w);
               }
+              themify(w, 0);
               w->position(slot == 1 ? PAD + 670 + PAD : PAD, g_matrix_y);
               w->show();
               show_page(2);
+          }
+
+          // Controllers window (portamento, pitch wheel ...) lives permanently in GLOBAL
+          void zyn_embed_global(Fl_Window *w, int)
+          {
+              if(!w)
+                  return;
+              if(!g_global) {
+                  w->show();
+                  return;
+              }
+              embed_into(g_global, w, g_ctl_x, g_ctl_y);
+              show_page(3);
+          }
+
+          // the part's three insert effects live in FX
+          void zyn_embed_fx(Fl_Window *w)
+          {
+              if(!w)
+                  return;
+              if(!g_fx) {
+                  w->show();
+                  return;
+              }
+              embed_into(g_fx, w, g_fxp_x, g_fxp_y);
+              show_page(1);
+          }
+
+          // Close buttons of embedded panels do nothing (the panel stays in its tab)
+          void zyn_close_panel(Fl_Window *w)
+          {
+              if(w && !w->parent())
+                  w->hide();
           }
 
           // "Edit instrument" button of the part panel
@@ -728,6 +864,7 @@ jobs:
                       w->parent()->remove(w);
                   g_engine->add(w);
               }
+              themify(w, 0);
               w->position(slot == 1 ? SLOT1_X : PAD, g_engine_y);
 
               // hide the other engine editors (keep the ADD global window next to the ADD voice window)
@@ -852,10 +989,17 @@ jobs:
               }
 
               for(int i = 0; i < 4; ++i)
-                  g_pages[i] = make_page(page_y, page_h, big && (i == 0 || i == 2));
+                  g_pages[i] = make_page(page_y, page_h, (big && (i == 0 || i == 2)) || i == 1 || i == 3);
               g_engine = big ? g_pages[0] : 0;
               g_matrix = big ? g_pages[2] : 0;
               g_matrix_y = page_y + PAD;
+              g_global = g_pages[3];
+              g_fx = g_pages[1];
+              {
+                  const char *th = getenv("ZYN_THEME");
+                  if(th && !strcmp(th, "classic"))
+                      g_theme = false;
+              }
 
               Fl_Box *strip = new Fl_Box(PAD, strip_y, WIN_W - 2 * PAD, STRIP_H,
                                          "ENVELOPE EDITOR\nThe envelope graph will show here (click E on a section) - next stage");
@@ -912,24 +1056,26 @@ jobs:
                   note(g_pages[0], PAD, g_engine_y, WIN_W - 2 * PAD, 200,
                        "ENGINES\n\nPress ADD SYNTH, SUB SYNTH or PAD SYNTH to open that editor inside this window.\n"
                        "An engine that is off is switched on automatically. The tick next to each name turns it on or off.");
-                  // GLOBAL: part panel next to the master controls
+                  // GLOBAL: part panel next to the master controls, controllers panel right of it
                   move_into(g_pages[3], ui->partuigroup, nx, page_y + PAD);
+                  g_ctl_x = nx + 390 + PAD;
+                  g_ctl_y = page_y + PAD;
               } else {
-                  // SMALL layout: keep the engine editor workflow unchanged, but put
-                  // the existing part controls on GLOBAL so portamento and related
-                  // instrument settings are not hidden on the ENGINES page.
-                  note(g_pages[0], PAD, page_y + PAD, WIN_W - 2 * PAD, 205,
+                  // small screen: part panel (with its Edit instrument button) stays on ENGINES
+                  g_ctl_x = nx;
+                  g_ctl_y = page_y + PAD;
+                  move_into(g_pages[0], ui->partuigroup, PAD, page_y + PAD);
+                  note(g_pages[0], nx, page_y + PAD, WIN_W - nx - PAD, 205,
                        "ENGINES\n\nClick 'Edit instrument' to open the ADD / SUB / PAD editors.\n"
-                       "The existing engine editors remain separate windows in this stage.");
-                  move_into(g_pages[3], ui->partuigroup, nx, page_y + PAD);
+                       "Your screen is too small to hold them inside this window,\n"
+                       "so they open as separate windows.");
               }
 
-              // FX page: existing effect tabs
+              // FX page: system / insertion effects on the left, the part's 3 insert effects on the right
               if(fxtabs)
                   move_into(g_pages[1], fxtabs, PAD, page_y + PAD);
-              note(g_pages[1], nx, page_y + PAD, WIN_W - nx - PAD, 165,
-                   "FX\n\nExisting system and insertion effect controls are preserved.\n"
-                   "The unified instrument-effect rack will be added in a later UI-only stage.");
+              g_fxp_x = nx;
+              g_fxp_y = page_y + PAD;
               if(!big)
                   note(g_pages[2], PAD, page_y + PAD, WIN_W - 2 * PAD, 120,
                        "MATRIX\n\nKit edit and the ADD voice list open as separate windows on small screens\n"
@@ -940,6 +1086,26 @@ jobs:
                   Fl_Widget *w = master_widgets[i];
                   g_pages[3]->add(w);
                   w->position(w->x() + PAD, w->y() - MENU_H + page_y + PAD);
+              }
+
+              // dark theme for the widgets that were moved
+              themify(ui->partuigroup, 1);
+              if(fxtabs)
+                  themify(fxtabs, 1);
+              for(size_t i = 0; i < master_widgets.size(); ++i)
+                  themify(master_widgets[i], 1);
+
+              // the old "Edit instrument" button is replaced by the ENGINES / MATRIX tabs
+              if(big)
+                  if(Fl_Widget *eb = find_by_label(ui->partuigroup, "Edit instrument"))
+                      eb->hide();
+
+              // controllers (portamento ...) and the part effects are shown permanently
+              if(ui->partui) {
+                  if(ui->partui->ctlwindow)
+                      zyn_embed_global(ui->partui->ctlwindow, 0);
+                  if(ui->partui->partfx)
+                      zyn_embed_fx(ui->partui->partfx);
               }
 
               if(big)
@@ -986,7 +1152,18 @@ jobs:
           patch('src/UI/ADnoteUI.fl', 'voicelistitem[i]->refreshlist();\n}\nADnoteVoiceList->show();}',
                 'voicelistitem[i]->refreshlist();\n}\nzyn_embed_matrix(ADnoteVoiceList,1);}')
           patch('src/UI/ADnoteUI.fl', '          ADnoteVoiceList->show();\n', '          zyn_embed_matrix(ADnoteVoiceList,1);\n')
-          print('unified ui stage 2d patches applied (GLOBAL part controls; engine/effect processing unchanged)')
+          # stage 3: controllers panel -> GLOBAL, the part's 3 insert effects -> FX
+          def patch_n(path, old, new, n):
+              s = open(path).read()
+              assert s.count(old) == n, (path, old[:60], s.count(old), n)
+              open(path, 'w').write(s.replace(old, new))
+          patch('src/UI/PartUI.fl', 'label Controllers\n      private xywh {777 376 500 135}', 'label Controllers\n      xywh {777 376 500 135}')
+          patch('src/UI/PartUI.fl', "label {Part's Insert Effects}\n      private xywh {569 775 390 145}", "label {Part's Insert Effects}\n      xywh {569 775 390 145}")
+          patch('src/UI/PartUI.fl', 'callback {ctlwindow->show();}', 'callback {zyn_embed_global(ctlwindow,0);}')
+          patch('src/UI/PartUI.fl', 'callback {ctlwindow->hide();}', 'callback {zyn_close_panel(ctlwindow);}')
+          patch('src/UI/PartUI.fl', 'callback {partfx->hide();}', 'callback {zyn_close_panel(partfx);}')
+          patch_n('src/UI/PartUI.fl', 'callback {partfx->show();}', 'callback {zyn_embed_fx(partfx);}', 2)
+          print('unified ui stage 3 patches applied')
           PYEOF
 
       - name: Crash diagnostics (abort hook and exit markers)
