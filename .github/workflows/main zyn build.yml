@@ -465,11 +465,11 @@ jobs:
           grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
           psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
           sed -n 715,730p src/main.cpp
-      - name: Apply unified UI (stage 3 - adaptive, engines inside the window)
+      - name: Apply unified UI (stage 5 - envelope strip, matrix close buttons)
         run: |
           cd zynaddsubfx-3.0.3
           cat > src/UI/UnifiedShell.h <<'HEOF'
-          // UnifiedShell.h - single-window layout, stage 3
+          // UnifiedShell.h - single-window layout, stage 5
           #pragma once
           class MasterUI;
           class Fl_Window;
@@ -486,6 +486,8 @@ jobs:
           void zyn_embed_fx(Fl_Window *w);
           // Close button of an embedded panel (does nothing when embedded)
           void zyn_close_panel(Fl_Window *w);
+          // envelope editor ("E" button): show the free-mode graph in the strip at the bottom; loc = OSC path of the envelope
+          void zyn_embed_envelope(Fl_Window *w, const char *loc);
           HEOF
           cat > src/UI/UnifiedShell.cpp <<'CPPEOF'
           // UnifiedShell.cpp - stage 3 of the single-window UI (adaptive).
@@ -518,12 +520,13 @@ jobs:
           #include <stdlib.h>
           #include <string.h>
           #include <vector>
+          #include <string>
 
           namespace {
 
           int WIN_W = 1000, WIN_H = 680;
-          const int MENU_H = 25, TAB_H = 40, SEL_H = 34, KB_H = 56;
-          const int STRIP_H = 96, PAD = 8;
+          int TAB_H = 40, KB_H = 56, STRIP_H = 96;
+          const int MENU_H = 25, SEL_H = 34, PAD = 8;
           const int SLOT1_X = PAD + 540 + PAD;   // ADD voice window sits right of the ADD global window
 
           Fl_Group  *g_pages[4]  = {0, 0, 0, 0};
@@ -538,6 +541,9 @@ jobs:
           Fl_Group  *g_fx        = 0;     // FX page (part effects panel)
           int        g_ctl_x = 0, g_ctl_y = 0, g_fxp_x = 0, g_fxp_y = 0;
           bool       g_theme     = true;
+          Fl_Group  *g_env       = 0;     // envelope strip (only when the screen is tall enough)
+          Fl_Button *g_envtab[4] = {0, 0, 0, 0};
+          Fl_Window *g_env_win[4] = {0, 0, 0, 0};   // last envelope window opened per tab (only compared, never used unless still in the strip)
           MasterUI  *g_ui        = 0;
 
           void sync_cb(void *);
@@ -568,8 +574,57 @@ jobs:
               }
           };
 
+          // Holds embedded envelope windows; they belong to their EnvelopeUI, so we only DETACH them.
+          class EnvStrip : public Fl_Group
+          {
+          public:
+              EnvStrip(int x, int y, int w, int h) : Fl_Group(x, y, w, h) {}
+              ~EnvStrip()
+              {
+                  g_env = 0;
+                  for(int i = children() - 1; i >= 0; --i) {
+                      Fl_Window *c = dynamic_cast<Fl_Window *>(child(i));
+                      if(c) {
+                          c->hide();
+                          remove(i);
+                      }
+                  }
+              }
+          };
+
           void show_page(int n);
           void prepare_matrix();
+
+          // show the last envelope opened for tab c (0 amplitude, 1 frequency, 2 filter, 3 modulation)
+          void show_env_category(int c)
+          {
+              if(!g_env)
+                  return;
+              for(int i = 0; i < 4; ++i)
+                  if(g_envtab[i])
+                      g_envtab[i]->value(i == c ? 1 : 0);
+              Fl_Window *target = g_env_win[c];
+              bool present = false;
+              for(int i = 0; i < g_env->children(); ++i) {
+                  Fl_Window *k = dynamic_cast<Fl_Window *>(g_env->child(i));
+                  if(!k)
+                      continue;
+                  if(k == target)
+                      present = true;
+                  else
+                      k->hide();
+              }
+              if(present)
+                  target->show();
+              else
+                  g_env_win[c] = 0;
+              g_env->redraw();
+          }
+
+          void env_tab_cb(Fl_Widget *, void *d)
+          {
+              show_env_category((int)(intptr_t)d);
+          }
 
           // ---- dark theme for the existing widgets (set ZYN_THEME=classic to turn it off) ----
           const Fl_Color C_TEXT()  { return fl_rgb_color(205, 228, 220); }
@@ -803,6 +858,12 @@ jobs:
                   g_matrix->add(w);
               }
               themify(w, 0);
+              // the Close buttons of the kit list and the voice list are not needed inside the tab
+              for(int i = 0; i < w->children(); ++i) {
+                  Fl_Widget *c = w->child(i);
+                  if(c->label() && !strncmp(c->label(), "Close", 5))
+                      c->hide();
+              }
               w->position(slot == 1 ? PAD + 670 + PAD : PAD, g_matrix_y);
               w->show();
               show_page(2);
@@ -839,6 +900,35 @@ jobs:
           {
               if(w && !w->parent())
                   w->hide();
+          }
+
+          // "E" button of an envelope: the free-mode editor (graph) is shown in the strip at the bottom
+          void zyn_embed_envelope(Fl_Window *w, const char *loc)
+          {
+              if(!w)
+                  return;
+              if(!g_env) {               // no strip on this screen: normal popup window like before
+                  w->show();
+                  w->position(Fl::event_x_root() - 20, Fl::event_y_root() + 20);
+                  return;
+              }
+              const std::string s(loc ? loc : "");
+              int cat = 0;                                   // amplitude
+              if(s.find("FM") != std::string::npos)
+                  cat = 3;                                   // modulator envelopes
+              else if(s.find("Filter") != std::string::npos)
+                  cat = 2;
+              else if(s.find("Freq") != std::string::npos || s.find("BandWidth") != std::string::npos)
+                  cat = 1;
+              if(w->parent() != g_env) {
+                  w->hide();
+                  if(w->parent())
+                      w->parent()->remove(w);
+                  g_env->add(w);
+              }
+              w->position(g_env->x(), g_env->y());
+              g_env_win[cat] = w;
+              show_env_category(cat);
           }
 
           // "Edit instrument" button of the part panel
@@ -912,10 +1002,19 @@ jobs:
                       big = false;
                   fprintf(stderr, "[UI] work area %dx%d -> %s layout\n", sw, sh, big ? "BIG" : "SMALL");
               }
+              bool envmode = false;
               if(big) {
                   WIN_W = 1366;
                   WIN_H = 912;
+                  if(sh >= 1030) {            // tall screen (1080p): taller window with a real envelope strip
+                      WIN_H = 988;
+                      STRIP_H = 184;
+                      TAB_H = 36;
+                      KB_H = 48;
+                      envmode = true;
+                  }
               }
+              fprintf(stderr, "[UI] envelope strip: %s\n", envmode ? "on" : "off");
 
               Fl_Window *win = ui->masterwindow;
 
@@ -1002,11 +1101,40 @@ jobs:
               }
 
               Fl_Box *strip = new Fl_Box(PAD, strip_y, WIN_W - 2 * PAD, STRIP_H,
-                                         "ENVELOPE EDITOR\nThe envelope graph will show here (click E on a section) - next stage");
+                                         envmode ? "" : "ENVELOPE EDITOR\nThe envelope graph needs a taller screen - E opens a normal window");
               strip->box(FL_FLAT_BOX);
               strip->color(fl_rgb_color(22, 30, 40));
               strip->labelcolor(fl_rgb_color(143, 167, 176));
               strip->labelsize(12);
+
+              if(envmode) {
+                  static const char *envnames[4] = {"AMPLITUDE", "FREQUENCY", "FILTER", "MODULATION"};
+                  const int tabh = (STRIP_H - 4) / 4;
+                  for(int i = 0; i < 4; ++i) {
+                      Fl_Button *b = new Fl_Button(PAD + 4, strip_y + 2 + i * tabh, 104, tabh - 3, envnames[i]);
+                      b->type(FL_RADIO_BUTTON);
+                      b->box(FL_FLAT_BOX);
+                      b->down_box(FL_FLAT_BOX);
+                      b->color(fl_rgb_color(14, 18, 24));
+                      b->selection_color(fl_rgb_color(0, 128, 76));
+                      b->labelcolor(fl_rgb_color(215, 240, 230));
+                      b->labelfont(FL_HELVETICA_BOLD);
+                      b->labelsize(12);
+                      b->clear_visible_focus();
+                      b->callback(env_tab_cb, (void *)(intptr_t)i);
+                      g_envtab[i] = b;
+                  }
+                  const int hx = PAD + 112 + 575 + 12;
+                  Fl_Box *hint = new Fl_Box(hx, strip_y + 4, WIN_W - PAD - hx - 8, STRIP_H - 8,
+                                            "ENVELOPE EDITOR\n\nPress E on any envelope to see its graph here.\n"
+                                            "The tabs jump back to the last envelope\nyou opened of each kind.");
+                  hint->box(FL_NO_BOX);
+                  hint->labelcolor(fl_rgb_color(143, 167, 176));
+                  hint->labelsize(12);
+                  hint->align(FL_ALIGN_CENTER | FL_ALIGN_WRAP);
+                  g_env = new EnvStrip(PAD + 112, strip_y + 2, 575, STRIP_H - 4);
+                  g_env->end();
+              }
 
               VirKeys *kb = new VirKeys(PAD, kb_y, WIN_W - 2 * PAD, KB_H, "Keyboard");
               kb->box(FL_BORDER_BOX);
@@ -1163,9 +1291,15 @@ jobs:
           patch('src/UI/PartUI.fl', 'callback {ctlwindow->hide();}', 'callback {zyn_close_panel(ctlwindow);}')
           patch('src/UI/PartUI.fl', 'callback {partfx->hide();}', 'callback {zyn_close_panel(partfx);}')
           patch_n('src/UI/PartUI.fl', 'callback {partfx->show();}', 'callback {zyn_embed_fx(partfx);}', 2)
-          print('unified ui stage 3 patches applied')
+          patch('src/UI/PartUI.fl', 'callback {instrumentkitlist->hide();}', 'callback {zyn_close_panel(instrumentkitlist);}')
+          patch('src/UI/ADnoteUI.fl', 'callback {ADnoteVoiceList->hide();}', 'callback {zyn_close_panel(ADnoteVoiceList);}')
+          # stage 5: the E button shows the envelope graph in the bottom strip
+          patch('src/UI/EnvelopeUI.fl', 'decl {\\#include "Fl_Osc_Dial.H"} {public local',
+                'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "Fl_Osc_Dial.H"} {public local')
+          patch('src/UI/EnvelopeUI.fl', 'freemodeeditwindow->show();\n    freemodeeditwindow->position(Fl::event_x_root()-20, Fl::event_y_root()+20);',
+                'zyn_embed_envelope(freemodeeditwindow, freemodeeditwindow->loc().c_str());')
+          print('unified ui stage 5 patches applied')
           PYEOF
-
       - name: Crash diagnostics (abort hook and exit markers)
         run: |
           cd zynaddsubfx-3.0.3
