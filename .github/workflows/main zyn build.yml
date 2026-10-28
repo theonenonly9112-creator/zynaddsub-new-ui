@@ -465,11 +465,11 @@ jobs:
           grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
           psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
           sed -n 715,730p src/main.cpp
-      - name: Apply unified UI (stage 2c - adaptive, engines inside the window)
+      - name: Apply unified UI (stage 2d - move part controls to GLOBAL; preserve engine and FX code)
         run: |
           cd zynaddsubfx-3.0.3
           cat > src/UI/UnifiedShell.h <<'HEOF'
-          // UnifiedShell.h - single-window layout, stage 2c
+          // UnifiedShell.h - single-window layout, stage 2d
           #pragma once
           class MasterUI;
           class Fl_Window;
@@ -482,7 +482,7 @@ jobs:
           void zyn_goto_engines(Fl_Window *fallback);
           HEOF
           cat > src/UI/UnifiedShell.cpp <<'CPPEOF'
-          // UnifiedShell.cpp - stage 2 of the single-window UI (adaptive).
+          // UnifiedShell.cpp - stage 2d: incremental UI-only layout refinement.
           // BIG screens (work area >= 1350x950): 1330x912 window, the ADD / SUB / PAD
           // editors are shown INSIDE the ENGINES tab (ADD global + ADD voice side by side).
           // SMALL screens: 1000x680 window, editors still open as normal windows.
@@ -915,21 +915,21 @@ jobs:
                   // GLOBAL: part panel next to the master controls
                   move_into(g_pages[3], ui->partuigroup, nx, page_y + PAD);
               } else {
-                  // small screen: part panel (with its Edit instrument button) stays on ENGINES
-                  move_into(g_pages[0], ui->partuigroup, PAD, page_y + PAD);
-                  note(g_pages[0], nx, page_y + PAD, WIN_W - nx - PAD, 205,
+                  // SMALL layout: keep the engine editor workflow unchanged, but put
+                  // the existing part controls on GLOBAL so portamento and related
+                  // instrument settings are not hidden on the ENGINES page.
+                  note(g_pages[0], PAD, page_y + PAD, WIN_W - 2 * PAD, 205,
                        "ENGINES\n\nClick 'Edit instrument' to open the ADD / SUB / PAD editors.\n"
-                       "Your screen is too small to hold them inside this window,\n"
-                       "so they open as separate windows.");
-                  note(g_pages[3], nx, page_y + PAD, WIN_W - nx - PAD, 120,
-                       "GLOBAL\n\nMaster controls are on the left.");
+                       "The existing engine editors remain separate windows in this stage.");
+                  move_into(g_pages[3], ui->partuigroup, nx, page_y + PAD);
               }
 
               // FX page: existing effect tabs
               if(fxtabs)
                   move_into(g_pages[1], fxtabs, PAD, page_y + PAD);
               note(g_pages[1], nx, page_y + PAD, WIN_W - nx - PAD, 165,
-                   "FX\n\nSystem and insertion effects are on the left.\nA single effect rack and editor comes in the next stage.");
+                   "FX\n\nExisting system and insertion effect controls are preserved.\n"
+                   "The unified instrument-effect rack will be added in a later UI-only stage.");
               if(!big)
                   note(g_pages[2], PAD, page_y + PAD, WIN_W - 2 * PAD, 120,
                        "MATRIX\n\nKit edit and the ADD voice list open as separate windows on small screens\n"
@@ -986,7 +986,7 @@ jobs:
           patch('src/UI/ADnoteUI.fl', 'voicelistitem[i]->refreshlist();\n}\nADnoteVoiceList->show();}',
                 'voicelistitem[i]->refreshlist();\n}\nzyn_embed_matrix(ADnoteVoiceList,1);}')
           patch('src/UI/ADnoteUI.fl', '          ADnoteVoiceList->show();\n', '          zyn_embed_matrix(ADnoteVoiceList,1);\n')
-          print('unified ui stage 2c patches applied')
+          print('unified ui stage 2d patches applied (GLOBAL part controls; engine/effect processing unchanged)')
           PYEOF
 
       - name: Crash diagnostics (abort hook and exit markers)
