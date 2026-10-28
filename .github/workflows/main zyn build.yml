@@ -465,7 +465,7 @@ jobs:
           grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
           psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
           sed -n 715,730p src/main.cpp
-      - name: Apply unified UI (stage 5 - envelope strip, matrix close buttons)
+      - name: Apply unified UI (stage 5 + shutdown trace)
         run: |
           cd zynaddsubfx-3.0.3
           cat > src/UI/UnifiedShell.h <<'HEOF'
@@ -488,6 +488,8 @@ jobs:
           void zyn_close_panel(Fl_Window *w);
           // envelope editor ("E" button): show the free-mode graph in the strip at the bottom; loc = OSC path of the envelope
           void zyn_embed_envelope(Fl_Window *w, const char *loc);
+          // append one line to zyn-trace.txt (flushed at once) - used to find where a crash happens
+          void zyn_trace(const char *msg);
           HEOF
           cat > src/UI/UnifiedShell.cpp <<'CPPEOF'
           // UnifiedShell.cpp - stage 3 of the single-window UI (adaptive).
@@ -521,6 +523,15 @@ jobs:
           #include <string.h>
           #include <vector>
           #include <string>
+
+          void zyn_trace(const char *msg)
+          {
+              FILE *f = fopen("zyn-trace.txt", "a");
+              if(f) {
+                  fprintf(f, "%s\n", msg);
+                  fclose(f);
+              }
+          }
 
           namespace {
 
@@ -557,6 +568,7 @@ jobs:
               EnginePage(int x, int y, int w, int h) : Fl_Group(x, y, w, h) {}
               ~EnginePage()
               {
+                  zyn_trace("EnginePage dtor: begin");
                   g_engine = 0;
                   g_matrix = 0;
                   g_global = 0;
@@ -571,6 +583,7 @@ jobs:
                           remove(i);
                       }
                   }
+                  zyn_trace("EnginePage dtor: end");
               }
           };
 
@@ -581,6 +594,7 @@ jobs:
               EnvStrip(int x, int y, int w, int h) : Fl_Group(x, y, w, h) {}
               ~EnvStrip()
               {
+                  zyn_trace("EnvStrip dtor");
                   g_env = 0;
                   for(int i = children() - 1; i >= 0; --i) {
                       Fl_Window *c = dynamic_cast<Fl_Window *>(child(i));
@@ -1298,6 +1312,14 @@ jobs:
                 'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "Fl_Osc_Dial.H"} {public local')
           patch('src/UI/EnvelopeUI.fl', 'freemodeeditwindow->show();\n    freemodeeditwindow->position(Fl::event_x_root()-20, Fl::event_y_root()+20);',
                 'zyn_embed_envelope(freemodeeditwindow, freemodeeditwindow->loc().c_str());')
+          patch('src/UI/MasterUI.fl', 'code {masterwindow->hide();\ndelete masterwindow;',
+                'code {zyn_trace("~MasterUI: hide masterwindow");\nmasterwindow->hide();\nzyn_trace("~MasterUI: delete masterwindow");\ndelete masterwindow;\nzyn_trace("~MasterUI: masterwindow deleted");')
+          patch('src/UI/PartUI.fl', 'ctlwindow->hide();\ndelete(ctlwindow);',
+                'zyn_trace("~PartUI: ctlwindow");\nctlwindow->hide();\ndelete(ctlwindow);')
+          patch('src/UI/PartUI.fl', 'partfx->hide();\ndelete(partfx);',
+                'zyn_trace("~PartUI: partfx");\npartfx->hide();\ndelete(partfx);')
+          patch('src/UI/PartUI.fl', 'instrumentkitlist->hide();\ndelete(instrumentkitlist);',
+                'zyn_trace("~PartUI: kitlist");\ninstrumentkitlist->hide();\ndelete(instrumentkitlist);\nzyn_trace("~PartUI: kitlist deleted");')
           print('unified ui stage 5 patches applied')
           PYEOF
       - name: Crash diagnostics (abort hook and exit markers)
