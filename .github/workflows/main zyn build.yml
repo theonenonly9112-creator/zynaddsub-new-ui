@@ -1946,6 +1946,226 @@ jobs:
           print('stage 4 patches applied')
           PYEOF
 
+      - name: Stage 8 (envelope graph in the plugin layout, Open/Save dialogs in front)
+        run: |
+          cd zynaddsubfx-3.0.3
+          cat > src/UI/zyn_winfile.h <<'WFEOF'
+          #pragma once
+          // Windows file dialogs that always come to the front.
+          // Inside a plugin window the editor is a child of the DAW's window; a normal dialog
+          // can then open BEHIND the DAW and looks as if Open / Save did nothing.
+          #include <windows.h>
+          #include <commdlg.h>
+          #include <stdio.h>
+          #include <string.h>
+
+          static int zyn_dlg_failed = 0;
+
+          static UINT_PTR CALLBACK zyn_ofn_hook(HWND dlg, UINT msg, WPARAM, LPARAM)
+          {
+              if(msg == WM_INITDIALOG) {
+                  HWND top = GetParent(dlg);
+                  if(!top)
+                      top = dlg;
+                  SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                  SetForegroundWindow(top);
+              }
+              return 0;
+          }
+
+          // pattern looks like "({*.xiz,*.xmz})"; returns the chosen file name or NULL
+          static char *zyn_win_dialog(int save, const char *title, const char *pattern)
+          {
+              static char chosen[1024];
+              char exts[256];
+              char defext[16];
+              int n = 0;
+              defext[0] = 0;
+              for(const char *p = pattern; p && *p && n < 240; ) {
+                  if(p[0] == '*' && p[1] == '.') {
+                      if(n)
+                          exts[n++] = ';';
+                      if(!defext[0]) {
+                          int d = 0;
+                          for(const char *q = p + 2; *q && *q != ',' && *q != '}' && *q != ')' && d < 14; ++q)
+                              defext[d++] = *q;
+                          defext[d] = 0;
+                      }
+                      while(*p && *p != ',' && *p != '}' && *p != ')' && n < 240)
+                          exts[n++] = *p++;
+                  } else
+                      p++;
+              }
+              exts[n] = 0;
+              if(!n)
+                  strcpy(exts, "*.*");
+
+              char filter[700];
+              int f = 0;
+              const char *l1 = "ZynAddSubFX files";
+              const char *l2 = "All files";
+              const char *a2 = "*.*";
+              memcpy(filter + f, l1, strlen(l1) + 1);   f += (int)strlen(l1) + 1;
+              memcpy(filter + f, exts, strlen(exts) + 1); f += (int)strlen(exts) + 1;
+              memcpy(filter + f, l2, strlen(l2) + 1);   f += (int)strlen(l2) + 1;
+              memcpy(filter + f, a2, strlen(a2) + 1);   f += (int)strlen(a2) + 1;
+              filter[f++] = 0;
+
+              OPENFILENAMEA ofn;
+              memset(&ofn, 0, sizeof(ofn));
+              chosen[0] = 0;
+              ofn.lStructSize = sizeof(ofn);
+              ofn.hwndOwner = NULL;
+              ofn.lpstrFilter = filter;
+              ofn.nFilterIndex = 1;
+              ofn.lpstrFile = chosen;
+              ofn.nMaxFile = sizeof(chosen);
+              ofn.lpstrTitle = title;
+              ofn.lpstrDefExt = defext[0] ? defext : NULL;
+              ofn.Flags = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_NOCHANGEDIR | OFN_ENABLEHOOK | OFN_PATHMUSTEXIST
+                          | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
+              ofn.lpfnHook = zyn_ofn_hook;
+
+              zyn_dlg_failed = 0;
+              fprintf(stderr, "[DLG] %s dialog: %s\n", save ? "save" : "open", title ? title : "");
+              BOOL ok = save ? GetSaveFileNameA(&ofn) : GetOpenFileNameA(&ofn);
+              if(!ok) {
+                  DWORD e = CommDlgExtendedError();
+                  if(e) {
+                      zyn_dlg_failed = 1;
+                      fprintf(stderr, "[DLG] dialog failed, error %lu (using the old dialog)\n", (unsigned long)e);
+                  } else
+                      fprintf(stderr, "[DLG] cancelled\n");
+                  return NULL;
+              }
+              fprintf(stderr, "[DLG] chosen: %s\n", chosen);
+              return chosen;
+          }
+          WFEOF
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+
+          def wr(p, s):
+              open(p, 'w').write(s)
+
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # ------------------------------------------------------------ Open / Save dialogs that come to the front
+          MU = 'src/UI/MasterUI.fl'
+          sub1(MU, 'decl {\\#include <FL/Fl_Native_File_Chooser.H>} {private local\n} \n',
+               'decl {\\#include "zyn_winfile.h"} {private local\n} \n\n'
+               'decl {\\#include <FL/Fl_Native_File_Chooser.H>} {private local\n} \n')
+          sub1(MU, '    if(strncmp(message, "Save", 4) && strncmp(message, "Record", 6) && strncmp(message, "Export", 6))\n        return (fl_file_chooser)(message, pattern, fname, relative);\n',
+               '    {\n'
+               '        const int zyn_is_save = !(strncmp(message, "Save", 4) && strncmp(message, "Record", 6) && strncmp(message, "Export", 6));\n'
+               '        char *zyn_picked = zyn_win_dialog(zyn_is_save, message, pattern);\n'
+               '        if(zyn_picked || !zyn_dlg_failed)\n'
+               '            return zyn_picked;\n'
+               '    }\n'
+               '    if(strncmp(message, "Save", 4) && strncmp(message, "Record", 6) && strncmp(message, "Export", 6))\n        return (fl_file_chooser)(message, pattern, fname, relative);\n')
+
+          # ------------------------------------------------------------ envelope graph under the engine editor (plugin / 912 px layout)
+          C = 'src/UI/UnifiedShell.cpp'
+          COMPACT = r'''// ---- compact envelope panel (912 px layout, e.g. inside the plugin window) ----
+          // It sits in the free space of the ENGINES page: under the ADD / PAD editor, or right of the SUB editor.
+          Fl_Box *g_chint = 0;
+
+          void compact_env_place(int sel)
+          {
+              if(!g_chint || !g_graph || !g_env)
+                  return;
+              int x, y, w, h;
+              if(sel == 2) {
+                  x = PAD + 735 + PAD;
+                  y = g_engine_y;
+                  w = WIN_W - PAD - x;
+                  h = 200;
+              } else {
+                  x = PAD;
+                  y = g_engine_y + 430 + PAD;
+                  w = 540;
+                  h = g_engine_y + 630 - y;
+              }
+              const int th = 24, fh = 28;
+              const int gy = y + th + 2;
+              const int gh = h - th - fh - 6;
+              g_chint->resize(x, y, w, h);
+              for(int i = 0; i < 4; ++i)
+                  if(g_envtab[i])
+                      g_envtab[i]->resize(x + i * (w / 4), y, w / 4 - 2, th);
+              g_graph->resize(x, gy, w, gh);
+              g_env->resize(x, gy, w, gh);
+              for(int i = 0; i < g_env->children(); ++i) {
+                  Fl_Window *k = dynamic_cast<Fl_Window *>(g_env->child(i));
+                  if(k)
+                      k->resize(x, gy, w, gh);
+              }
+              if(g_freebtn)
+                  g_freebtn->resize(x, y + h - fh, w, fh);
+              g_chint->redraw();
+          }
+
+          '''
+          sub1(C, '// ---- dark theme for the existing widgets', COMPACT + '// ---- dark theme for the existing widgets')
+          sub1(C, 'if(!g_env || !g_graph) {   // no strip on this screen: open the point editor like before',
+               'if(!g_graph) {   // no graph on this screen: open the point editor like before')
+          sub1(C, '    w->position(g_env->x(), g_env->y());',
+               '    w->resize(g_env->x(), g_env->y(), g_env->w(), g_env->h());')
+          sub1(C, '            g_engbtn[i]->value(i == b ? 1 : 0);\n    g_engine->redraw();',
+               '            g_engbtn[i]->value(i == b ? 1 : 0);\n'
+               '    compact_env_place((slot == 2) ? 2 : (slot == 3) ? 3 : 0);\n'
+               '    g_engine->redraw();')
+
+          PANEL = r'''        if(!envmode) {
+                      // compact envelope panel: tabs, live graph, FREE MODE EDIT (see compact_env_place)
+                      static const char *cn[4] = {"Amplitude", "Frequency", "Filter", "Modulation"};
+                      const int cy = g_engine_y + 430 + PAD;
+                      g_chint = new Fl_Box(PAD, cy, 540, 192);
+                      g_chint->box(FL_FLAT_BOX);
+                      g_chint->color(fl_rgb_color(18, 24, 32));
+                      for(int i = 0; i < 4; ++i) {
+                          Fl_Button *eb = new Fl_Button(PAD + i * 135, cy, 133, 24, cn[i]);
+                          eb->type(FL_TOGGLE_BUTTON);
+                          eb->box(FL_FLAT_BOX);
+                          eb->down_box(FL_FLAT_BOX);
+                          eb->color(fl_rgb_color(22, 30, 40));
+                          eb->selection_color(fl_rgb_color(0, 128, 76));
+                          eb->labelcolor(fl_rgb_color(215, 240, 230));
+                          eb->labelfont(FL_HELVETICA_BOLD);
+                          eb->labelsize(12);
+                          eb->clear_visible_focus();
+                          eb->callback(env_tab_cb, (void *)(intptr_t)i);
+                          g_envtab[i] = eb;
+                      }
+                      g_envtab[0]->value(1);
+                      g_graph = new EnvGraph(PAD, cy + 26, 540, 134);
+                      g_freebtn = new Fl_Button(PAD, cy + 164, 540, 28, "FREE MODE EDIT (points)");
+                      g_freebtn->box(FL_FLAT_BOX);
+                      g_freebtn->color(fl_rgb_color(22, 30, 40));
+                      g_freebtn->labelcolor(fl_rgb_color(215, 240, 230));
+                      g_freebtn->labelsize(12);
+                      g_freebtn->clear_visible_focus();
+                      g_freebtn->callback(env_free_cb);
+                      g_env = new EnvStrip(PAD, cy + 26, 540, 134);
+                      g_env->end();
+                      Fl::add_timeout(0.1, env_tick);
+                  }
+          '''
+          sub1(C, '        ib->callback(instr_cb);\n        g_pages[0]->end();',
+               '        ib->callback(instr_cb);\n' + PANEL + '        g_pages[0]->end();')
+
+          sub1(C, 'envmode ? \\"\\" : \\"ENVELOPE EDITOR\\\\nThe envelope graph needs a taller screen - E opens a normal window\\"'
+               if False else 'envmode ? "" : "ENVELOPE EDITOR\\nThe envelope graph needs a taller screen - E opens a normal window"',
+               'envmode ? "" : (big ? "ENVELOPE EDITOR\\nEnvelope graphs are in the ENGINES tab, under the engine editor (press E on an envelope)"'
+               ' : "ENVELOPE EDITOR\\nThe envelope graph needs a taller screen - E opens a normal window")')
+          print('stage 8 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
