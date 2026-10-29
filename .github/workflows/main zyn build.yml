@@ -253,8 +253,8 @@ jobs:
                   SetBkMode(dc, TRANSPARENT);
                   SetTextColor(dc, RGB(0, 230, 120));
                   const char *t1 = "ZynAddSubFX editor";
-                  const char *t2 = "The editor opens in its own window.";
-                  const char *t3 = "Close this panel to close the editor.";
+                  const char *t2 = "Loading the editor ...";
+                  const char *t3 = "";
                   TextOutA(dc, 12, 12, t1, (int)strlen(t1));
                   TextOutA(dc, 12, 40, t2, (int)strlen(t2));
                   TextOutA(dc, 12, 64, t3, (int)strlen(t3));
@@ -272,8 +272,8 @@ jobs:
               {
                   fRect.top    = 0;
                   fRect.left   = 0;
-                  fRect.bottom = 525;
-                  fRect.right  = 390;
+                  fRect.bottom = 912;
+                  fRect.right  = 1366;
               }
 
               ~ZynExtEditor()
@@ -301,7 +301,7 @@ jobs:
                   RegisterClassA(&wc); // fails harmlessly if it already exists
 
                   fHwnd = CreateWindowExA(0, "ZynRemotePanel", "", WS_CHILD | WS_VISIBLE,
-                                          0, 0, 390, 525, (HWND)parent, NULL, (HINSTANCE)mod, NULL);
+                                          0, 0, 1366, 912, (HWND)parent, NULL, (HINSTANCE)mod, NULL);
 
                   launch(mod, oscPort);
               }
@@ -341,8 +341,8 @@ jobs:
                   snprintf(exe, sizeof(exe), "%szynaddsubfx-ext-gui.exe", dir);
 
                   char cmd[2 * MAX_PATH + 160];
-                  snprintf(cmd, sizeof(cmd), "\"%s\" --title \"ZynAddSubFX\" osc.udp://localhost:%d/",
-                           exe, oscPort);
+                  snprintf(cmd, sizeof(cmd), "\"%s\" --embed %llu --title \"ZynAddSubFX\" osc.udp://localhost:%d/",
+                           exe, (unsigned long long)(size_t)fHwnd, oscPort);
 
                   STARTUPINFOA si;
                   memset(&si, 0, sizeof(si));
@@ -465,7 +465,7 @@ jobs:
           grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
           psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
           sed -n 715,730p src/main.cpp
-      - name: Apply unified UI (stage 6 - FX filters, live envelope graph)
+      - name: Apply unified UI (stage 7 - PANEL tab, no vK, editor inside the plugin window)
         run: |
           cd zynaddsubfx-3.0.3
           cat > src/UI/UnifiedShell.h <<'HEOF'
@@ -497,7 +497,9 @@ jobs:
           void zyn_env_select(void *key, const char *loc, int mode, Fl_Valuator *a_val, Fl_Valuator *a_dt,
                               Fl_Valuator *d_val, Fl_Valuator *d_dt, Fl_Valuator *s_val, Fl_Valuator *r_val,
                               Fl_Valuator *r_dt);
-          void zyn_env_forget(void *key);   // the envelope is being deleted
+          void zyn_env_forget(void *key);
+          // "Panel Window" button: the 16 part mixer lives in the PANEL tab
+          void zyn_embed_panel(Fl_Window *w);   // the envelope is being deleted
           HEOF
           cat > src/UI/UnifiedShell.cpp <<'CPPEOF'
           // UnifiedShell.cpp - stage 3 of the single-window UI (adaptive).
@@ -550,8 +552,9 @@ jobs:
           const int MENU_H = 25, SEL_H = 34, PAD = 8;
           const int SLOT1_X = PAD + 540 + PAD;   // ADD voice window sits right of the ADD global window
 
-          Fl_Group  *g_pages[4]  = {0, 0, 0, 0};
-          Fl_Button *g_tabs[4]   = {0, 0, 0, 0};
+          Fl_Group  *g_pages[5]  = {0, 0, 0, 0, 0};
+          Fl_Window *g_panelw    = 0;     // the 16 part panel (PANEL tab)
+          Fl_Button *g_tabs[5]   = {0, 0, 0, 0, 0};
           Fl_Button *g_engbtn[3] = {0, 0, 0};
           Fl_Check_Button *g_engon[3] = {0, 0, 0};   // "engine on" ticks next to the engine buttons
           Fl_Group  *g_engine    = 0;     // only set in BIG mode
@@ -879,7 +882,7 @@ jobs:
 
           void show_page(int n)
           {
-              for(int i = 0; i < 4; ++i) {
+              for(int i = 0; i < 5; ++i) {
                   if(g_pages[i]) {
                       if(i == n)
                           g_pages[i]->show();
@@ -888,6 +891,16 @@ jobs:
                   }
                   if(g_tabs[i])
                       g_tabs[i]->value(i == n ? 1 : 0);
+              }
+              if(n == 4 && g_pages[4] && g_panelw) {
+                  if(g_ui)
+                      g_ui->updatepanel();
+                  embed_into(g_pages[4], g_panelw, PAD, g_pages[4]->y() + PAD);
+                  for(int i = 0; i < g_panelw->children(); ++i) {
+                      Fl_Widget *c = g_panelw->child(i);
+                      if(c->label() && !strcmp(c->label(), "Close"))
+                          c->hide();
+                  }
               }
               if(g_pages[n] && g_pages[n]->window())
                   g_pages[n]->window()->redraw();
@@ -1142,6 +1155,19 @@ jobs:
               show_page(1);
           }
 
+          // "Panel Window" button: show the PANEL tab (small layout: normal window)
+          void zyn_embed_panel(Fl_Window *w)
+          {
+              if(!w)
+                  return;
+              if(!g_pages[4]) {
+                  w->show();
+                  return;
+              }
+              g_panelw = w;
+              show_page(4);
+          }
+
           // "Edit instrument" button of the part panel
           void zyn_goto_engines(Fl_Window *fallback)
           {
@@ -1186,6 +1212,18 @@ jobs:
               g_engine->redraw();
           }
 
+          // hide every button with this label (the virtual keyboard button is not needed any more)
+          static void hide_button(Fl_Group *g, const char *label)
+          {
+              for(int i = 0; i < g->children(); ++i) {
+                  Fl_Widget *c = g->child(i);
+                  if(c->label() && !strcmp(c->label(), label))
+                      c->hide();
+                  else if(Fl_Group *sub = c->as_group())
+                      hide_button(sub, label);
+              }
+          }
+
           void zyn_unified_shell(MasterUI *ui)
           {
               static bool done = false;
@@ -1217,7 +1255,7 @@ jobs:
               if(big) {
                   WIN_W = 1366;
                   WIN_H = 912;
-                  if(sh >= 1030) {            // tall screen (1080p): taller window with a real envelope strip
+                  if(sh >= 1030 && !getenv("ZYN_UI_NOENV")) {            // tall screen (1080p): taller window with a real envelope strip
                       WIN_H = 988;
                       STRIP_H = 184;
                       TAB_H = 36;
@@ -1282,8 +1320,9 @@ jobs:
               logo->labelsize(18);
               logo->align(FL_ALIGN_LEFT | FL_ALIGN_INSIDE);
 
-              static const char *names[4] = {"ENGINES", "FX", "MATRIX", "GLOBAL"};
-              for(int i = 0; i < 4; ++i) {
+              static const char *names[5] = {"ENGINES", "FX", "MATRIX", "GLOBAL", "PANEL"};
+              const int ntabs = big ? 5 : 4;
+              for(int i = 0; i < ntabs; ++i) {
                   Fl_Button *b = new Fl_Button(250 + i * 116, bar_y + 4, 110, TAB_H - 8, names[i]);
                   b->type(FL_RADIO_BUTTON);
                   b->box(FL_FLAT_BOX);
@@ -1298,13 +1337,15 @@ jobs:
                   g_tabs[i] = b;
               }
 
-              for(int i = 0; i < 4; ++i)
-                  g_pages[i] = make_page(page_y, page_h, (big && (i == 0 || i == 2)) || i == 1 || i == 3);
+              for(int i = 0; i < ntabs; ++i)
+                  g_pages[i] = make_page(page_y, page_h, (big && (i == 0 || i == 2)) || i == 1 || i == 3 || i == 4);
               g_engine = big ? g_pages[0] : 0;
               g_matrix = big ? g_pages[2] : 0;
               g_matrix_y = page_y + PAD;
               g_global = g_pages[3];
               g_fx = g_pages[1];
+              if(big)
+                  g_panelw = ui->panelwindow;
               {
                   const char *th = getenv("ZYN_THEME");
                   if(th && !strcmp(th, "classic"))
@@ -1459,6 +1500,7 @@ jobs:
               if(big)
                   Fl::add_timeout(0.3, sync_cb);
 
+              hide_button(win, "vK");
               show_page(0);
               win->redraw();
           }
@@ -1566,6 +1608,43 @@ jobs:
           } {}
             }
             Function {open_as_freemode()} {open''')
+          # stage 7: panel tab, and the editor embedded in the plugin window
+          patch('src/UI/MasterUI.fl', 'callback {updatepanel();\npanelwindow->show();}', 'callback {zyn_embed_panel(panelwindow);}')
+          patch('src/UI/guimain.cpp', '    ui = new MasterUI((int*)exit, osc);\n',
+          '''#ifdef _WIN32
+              if (embedId != NULL && atoll(embedId) > 1) {
+                  _putenv("ZYN_UI_SIZE=big");   // the plugin editor always uses the 1366x912 layout
+                  _putenv("ZYN_UI_NOENV=1");
+              }
+          #endif
+              ui = new MasterUI((int*)exit, osc);
+          ''')
+          patch('src/UI/guimain.cpp', '''#ifdef NTK_GUI
+                      if (winId != 1)
+                      {
+                          MasterUI::menu_mastermenu[13].hide(); // file -> exit
+                          fl_embed(ui->masterwindow, winId);
+                      }
+          #endif
+                      ui->masterwindow->show();''','''#ifdef _WIN32
+                      ui->masterwindow->border(0);
+          #endif
+                      ui->masterwindow->show();
+          #ifdef _WIN32
+                      if (winId != 1)
+                      {
+                          // become a child window of the host's plugin window
+                          MasterUI::menu_mastermenu[13].hide(); // file -> exit
+                          HWND h = fl_xid(ui->masterwindow);
+                          LONG st = GetWindowLong(h, GWL_STYLE);
+                          st &= ~(WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_BORDER | WS_DLGFRAME);
+                          st |= WS_CHILD | WS_VISIBLE;
+                          SetWindowLong(h, GWL_STYLE, st);
+                          SetParent(h, (HWND)(intptr_t)winId);
+                          SetWindowPos(h, NULL, 0, 0, ui->masterwindow->w(), ui->masterwindow->h(),
+                                       SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+                      }
+          #endif''')
           print('stage 6 patches applied')
           print('unified ui stage 5 patches applied')
           PYEOF
