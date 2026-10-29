@@ -2166,6 +2166,118 @@ jobs:
           print('stage 8 patches applied')
           PYEOF
 
+      - name: Stage 9 (menus and drop-downs in the plugin window, preset buttons in GLOBAL)
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+
+          def wr(p, s):
+              open(p, 'w').write(s)
+
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # ------------------------------------------------------------ menus / drop-downs in the plugin window
+          G = 'src/UI/guimain.cpp'
+          SYNC = r'''#ifdef _WIN32
+          static MasterUI *zyn_sync_ui = 0;
+          // In the plugin the editor is a child window of the DAW's window. FLTK then believes the window
+          // sits at the position the host gave it, so every pop-up menu and drop-down list opens in the wrong
+          // place (File / Instrument / Record look dead). Keep FLTK's idea of the window position equal to the
+          // real screen position.
+          static void zyn_sync_root(void *)
+          {
+              if(zyn_sync_ui && zyn_sync_ui->masterwindow && zyn_sync_ui->masterwindow->shown()) {
+                  HWND h = fl_xid(zyn_sync_ui->masterwindow);
+                  POINT p;
+                  p.x = 0;
+                  p.y = 0;
+                  if(h && ClientToScreen(h, &p)) {
+                      Fl_Window *w = zyn_sync_ui->masterwindow;
+                      if(w->x() != p.x || w->y() != p.y)
+                          w->Fl_Widget::resize(p.x, p.y, w->w(), w->h());
+                  }
+              }
+              Fl::repeat_timeout(0.05, zyn_sync_root);
+          }
+          #endif
+
+          '''
+          sub1(G, 'ui_handle_t GUI::createUi(Fl_Osc_Interface *osc, void *exit)\n{',
+               SYNC + 'ui_handle_t GUI::createUi(Fl_Osc_Interface *osc, void *exit)\n{')
+          sub1(G, '                             SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);\n',
+               '                             SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);\n'
+               '                zyn_sync_ui = (MasterUI *)ui;\n'
+               '                Fl::add_timeout(0.0, zyn_sync_root);\n')
+          sub1(G, 'void GUI::destroyUi(ui_handle_t ui)\n{\n    delete static_cast<MasterUI*>(ui);',
+               'void GUI::destroyUi(ui_handle_t ui)\n{\n'
+               '#ifdef _WIN32\n    Fl::remove_timeout(zyn_sync_root);\n    zyn_sync_ui = 0;\n#endif\n'
+               '    delete static_cast<MasterUI*>(ui);')
+
+          # the plugin's own panel must not paint over the editor window ("Loading the editor..." text)
+          sub1('DPF/distrho/src/zyn_vst_editor.h', 'WS_CHILD | WS_VISIBLE,\n                                0, 0, 1366, 912',
+               'WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,\n                                0, 0, 1366, 912')
+
+          # ------------------------------------------------------------ preset buttons in the GLOBAL tab
+          C = 'src/UI/UnifiedShell.cpp'
+          sub1(C, 'MasterUI  *g_ui        = 0;', 'MasterUI  *g_ui        = 0;\nFl_Menu_Bar *g_menu    = 0;')
+          PCB = r'''// preset buttons: run the same action as Instrument > Open Instrument / Save Instrument
+          void preset_cb(Fl_Widget *, void *d)
+          {
+              if(!g_menu)
+                  return;
+              const char *want = (d == 0) ? "&Open Instrument..." : "&Save Instrument ...";
+              const Fl_Menu_Item *m = g_menu->menu();
+              if(!m)
+                  return;
+              const int n = m->size();
+              for(int i = 0; i < n; ++i) {
+                  if(m[i].label() && !strcmp(m[i].label(), want)) {
+                      m[i].do_callback(g_menu);
+                      return;
+                  }
+              }
+              fprintf(stderr, "[UI] preset button: menu entry '%s' not found\n", want);
+          }
+
+          '''
+          sub1(C, '// ---- compact envelope panel (912 px layout', PCB + '// ---- compact envelope panel (912 px layout')
+          BTN = r'''    {   // GLOBAL: preset buttons (same as the Instrument menu)
+                  g_menu = menu;
+                  const int by = big ? page_y + PAD + 205 + 16 : page_y + PAD + 135 + PAD;
+                  g_pages[3]->begin();
+                  Fl_Box *ph = new Fl_Box(nx, by, 390, 22, "PRESETS  (instrument .xiz files)");
+                  ph->box(FL_NO_BOX);
+                  ph->labelcolor(fl_rgb_color(143, 167, 176));
+                  ph->labelsize(12);
+                  ph->align(FL_ALIGN_INSIDE | FL_ALIGN_LEFT);
+                  static const char *pn[2] = {"OPEN PRESET", "SAVE PRESET"};
+                  for(int i = 0; i < 2; ++i) {
+                      Fl_Button *pb = new Fl_Button(nx + i * 200, by + 26, 190, 44, pn[i]);
+                      pb->box(FL_FLAT_BOX);
+                      pb->down_box(FL_FLAT_BOX);
+                      pb->color(fl_rgb_color(22, 30, 40));
+                      pb->selection_color(fl_rgb_color(0, 128, 76));
+                      pb->labelcolor(fl_rgb_color(215, 240, 230));
+                      pb->labelfont(FL_HELVETICA_BOLD);
+                      pb->labelsize(14);
+                      pb->clear_visible_focus();
+                      pb->callback(preset_cb, (void *)(intptr_t)i);
+                  }
+                  g_pages[3]->end();
+              }
+
+          '''
+          sub1(C, "    // FX page: system / insertion effects on the left, the part's 3 insert effects on the right\n",
+               BTN + "    // FX page: system / insertion effects on the left, the part's 3 insert effects on the right\n")
+          print('stage 9 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
