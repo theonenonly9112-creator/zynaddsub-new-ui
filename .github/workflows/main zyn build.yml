@@ -465,7 +465,7 @@ jobs:
           grep -n "pdialcolor(\|fl_color(30" src/UI/WidgetPDial.cpp | head -8
           psed 's|^        middleware->tick();$|#if defined(WIN32) \&\& !defined(ZEST_GUI)\n        if(!noui) GUI::tickUi(gui);\n#endif\n        middleware->tick();|' src/main.cpp
           sed -n 715,730p src/main.cpp
-      - name: Apply unified UI (stage 5 + shutdown trace)
+      - name: Apply unified UI (stage 6 - FX filters, live envelope graph)
         run: |
           cd zynaddsubfx-3.0.3
           cat > src/UI/UnifiedShell.h <<'HEOF'
@@ -473,6 +473,7 @@ jobs:
           #pragma once
           class MasterUI;
           class Fl_Window;
+          class Fl_Valuator;
           void zyn_unified_shell(MasterUI *ui);
           // show an engine editor inside the ENGINES tab (slot 0 = ADD global, 1 = ADD voice, 2 = SUB, 3 = PAD)
           void zyn_embed_engine(Fl_Window *w, int slot);
@@ -490,6 +491,13 @@ jobs:
           void zyn_embed_envelope(Fl_Window *w, const char *loc);
           // append one line to zyn-trace.txt (flushed at once) - used to find where a crash happens
           void zyn_trace(const char *msg);
+          // formant filter editor (kind 0) and DynFilter filter window (kind 1) live in the FX tab
+          void zyn_embed_fx_filter(Fl_Window *w, int kind);
+          // envelope "E" button: remember this envelope and draw its graph (live, from the knobs) in the strip
+          void zyn_env_select(void *key, const char *loc, int mode, Fl_Valuator *a_val, Fl_Valuator *a_dt,
+                              Fl_Valuator *d_val, Fl_Valuator *d_dt, Fl_Valuator *s_val, Fl_Valuator *r_val,
+                              Fl_Valuator *r_dt);
+          void zyn_env_forget(void *key);   // the envelope is being deleted
           HEOF
           cat > src/UI/UnifiedShell.cpp <<'CPPEOF'
           // UnifiedShell.cpp - stage 3 of the single-window UI (adaptive).
@@ -500,6 +508,7 @@ jobs:
           #include "UnifiedShell.h"
           #include "MasterUI.h"
           #include "PartUI.h"
+          #include "EnvelopeUI.h"
           #include "Fl_Osc_Pane.H"
           #include "Fl_Osc_Check.H"
           #include <FL/Fl.H>
@@ -516,6 +525,7 @@ jobs:
           #include <FL/Fl_Menu_Bar.H>
           #include <FL/Fl_Tabs.H>
           #include <FL/Fl_Window.H>
+          #include <FL/Fl_Valuator.H>
           #include <FL/fl_draw.H>
           #include <stdint.h>
           #include <stdio.h>
@@ -554,7 +564,20 @@ jobs:
           bool       g_theme     = true;
           Fl_Group  *g_env       = 0;     // envelope strip (only when the screen is tall enough)
           Fl_Button *g_envtab[4] = {0, 0, 0, 0};
-          Fl_Window *g_env_win[4] = {0, 0, 0, 0};   // last envelope window opened per tab (only compared, never used unless still in the strip)
+          Fl_Window *g_env_win[4] = {0, 0, 0, 0};
+          // the envelope shown in the graph, one per tab (0 amplitude, 1 frequency, 2 filter, 3 modulation)
+          struct EnvSrc {
+              void *key;
+              int mode;
+              Fl_Valuator *v[7];        // a_val, a_dt, d_val, d_dt, s_val, r_val, r_dt
+              std::string loc;
+              EnvSrc() : key(0), mode(0) { for(int i = 0; i < 7; ++i) v[i] = 0; }
+          };
+          EnvSrc     g_src[4];
+          int        g_cur = 0;
+          Fl_Widget *g_graph = 0;
+          Fl_Button *g_freebtn = 0;
+          void env_tick(void *);   // last envelope window opened per tab (only compared, never used unless still in the strip)
           MasterUI  *g_ui        = 0;
 
           void sync_cb(void *);
@@ -569,6 +592,8 @@ jobs:
               ~EnginePage()
               {
                   zyn_trace("EnginePage dtor: begin");
+                  Fl::remove_timeout(env_tick);
+                  g_graph = 0;
                   g_engine = 0;
                   g_matrix = 0;
                   g_global = 0;
@@ -606,6 +631,105 @@ jobs:
               }
           };
 
+          double val(Fl_Valuator *v)
+          {
+              return v ? v->value() : 0.0;
+          }
+
+          int env_category(const char *loc)
+          {
+              const std::string s(loc ? loc : "");
+              if(s.find("FM") != std::string::npos)
+                  return 3;                                   // modulator envelopes
+              if(s.find("Filter") != std::string::npos)
+                  return 2;
+              if(s.find("Freq") != std::string::npos || s.find("BandWidth") != std::string::npos)
+                  return 1;
+              return 0;                                       // amplitude
+          }
+
+          // draws the envelope of the selected section straight from its knobs (no free mode needed)
+          class EnvGraph : public Fl_Widget
+          {
+          public:
+              EnvGraph(int x, int y, int w, int h) : Fl_Widget(x, y, w, h) {}
+              void draw()
+              {
+                  fl_push_clip(x(), y(), w(), h());
+                  fl_color(fl_rgb_color(8, 12, 16));
+                  fl_rectf(x(), y(), w(), h());
+                  fl_color(fl_rgb_color(26, 36, 46));
+                  for(int i = 1; i < 8; ++i)
+                      fl_line(x() + w() * i / 8, y(), x() + w() * i / 8, y() + h() - 1);
+                  for(int i = 1; i < 4; ++i)
+                      fl_line(x(), y() + h() * i / 4, x() + w() - 1, y() + h() * i / 4);
+                  const EnvSrc &s = g_src[g_cur];
+                  fl_font(FL_HELVETICA, 12);
+                  if(!s.key) {
+                      fl_color(fl_rgb_color(143, 167, 176));
+                      fl_draw("Press E on an envelope of this kind to see it here", x() + 12, y() + 22);
+                      fl_pop_clip();
+                      return;
+                  }
+                  double X[6], Y[6];
+                  int n = 0;
+                  const double hold = 0.18;
+                  const double A = 0.05 + 0.20 * val(s.v[1]) / 127.0;
+                  const double D = 0.05 + 0.20 * val(s.v[3]) / 127.0;
+                  const double R = 0.05 + 0.20 * val(s.v[6]) / 127.0;
+                  if(s.mode == 1 || s.mode == 2) {            // amplitude: A D S R
+                      const double sus = val(s.v[4]) / 127.0;
+                      X[0] = 0;            Y[0] = 0;
+                      X[1] = A;            Y[1] = 1;
+                      X[2] = A + D;        Y[2] = sus;
+                      X[3] = X[2] + hold;  Y[3] = sus;
+                      X[4] = X[3] + R;     Y[4] = 0;
+                      n = 5;
+                  } else if(s.mode == 4) {                    // filter
+                      X[0] = 0;            Y[0] = val(s.v[0]) / 127.0;
+                      X[1] = A;            Y[1] = val(s.v[2]) / 127.0;
+                      X[2] = A + D;        Y[2] = 0.5;
+                      X[3] = X[2] + hold;  Y[3] = 0.5;
+                      X[4] = X[3] + R;     Y[4] = val(s.v[5]) / 127.0;
+                      n = 5;
+                  } else {                                    // frequency and bandwidth
+                      X[0] = 0;            Y[0] = val(s.v[0]) / 127.0;
+                      X[1] = A;            Y[1] = 0.5;
+                      X[2] = A + hold;     Y[2] = 0.5;
+                      X[3] = X[2] + R;     Y[3] = val(s.v[5]) / 127.0;
+                      n = 4;
+                  }
+                  const double total = X[n - 1] > 0 ? X[n - 1] : 1;
+                  int px[6], py[6];
+                  const int bottom = y() + h() - 10;
+                  for(int i = 0; i < n; ++i) {
+                      px[i] = x() + 10 + (int)((w() - 20) * X[i] / total);
+                      py[i] = bottom - (int)((h() - 24) * Y[i]);
+                  }
+                  fl_color(fl_rgb_color(6, 56, 34));
+                  for(int i = 0; i + 1 < n; ++i)
+                      fl_polygon(px[i], py[i], px[i + 1], py[i + 1], px[i + 1], bottom, px[i], bottom);
+                  fl_color(fl_rgb_color(0, 215, 120));
+                  fl_line_style(FL_SOLID, 2);
+                  for(int i = 0; i + 1 < n; ++i)
+                      fl_line(px[i], py[i], px[i + 1], py[i + 1]);
+                  fl_line_style(0);
+                  for(int i = 0; i < n; ++i)
+                      fl_rectf(px[i] - 2, py[i] - 2, 5, 5);
+                  fl_color(fl_rgb_color(143, 167, 176));
+                  fl_font(FL_HELVETICA, 10);
+                  fl_draw(s.loc.c_str(), x() + 8, y() + 12);
+                  fl_pop_clip();
+              }
+          };
+
+          void env_tick(void *)
+          {
+              if(g_graph && g_graph->visible_r())
+                  g_graph->redraw();
+              Fl::repeat_timeout(0.1, env_tick);
+          }
+
           void show_page(int n);
           void prepare_matrix();
 
@@ -614,6 +738,9 @@ jobs:
           {
               if(!g_env)
                   return;
+              g_cur = c;
+              if(g_graph)
+                  g_graph->hide();
               for(int i = 0; i < 4; ++i)
                   if(g_envtab[i])
                       g_envtab[i]->value(i == c ? 1 : 0);
@@ -635,9 +762,35 @@ jobs:
               g_env->redraw();
           }
 
+          // show the live graph of the envelope chosen for tab c
+          void show_graph(int c)
+          {
+              if(!g_env || !g_graph)
+                  return;
+              g_cur = c;
+              for(int i = 0; i < 4; ++i)
+                  if(g_envtab[i])
+                      g_envtab[i]->value(i == c ? 1 : 0);
+              for(int i = 0; i < g_env->children(); ++i) {
+                  Fl_Window *k = dynamic_cast<Fl_Window *>(g_env->child(i));
+                  if(k)
+                      k->hide();
+              }
+              g_graph->show();
+              g_graph->redraw();
+          }
+
           void env_tab_cb(Fl_Widget *, void *d)
           {
-              show_env_category((int)(intptr_t)d);
+              show_graph((int)(intptr_t)d);
+          }
+
+          // FREE MODE EDIT: open the point editor of the selected envelope (it is converted to free mode)
+          void env_free_cb(Fl_Widget *, void *)
+          {
+              const EnvSrc &s = g_src[g_cur];
+              if(s.key)
+                  ((EnvelopeUI *)s.key)->open_as_freemode();
           }
 
           // ---- dark theme for the existing widgets (set ZYN_THEME=classic to turn it off) ----
@@ -926,14 +1079,7 @@ jobs:
                   w->position(Fl::event_x_root() - 20, Fl::event_y_root() + 20);
                   return;
               }
-              const std::string s(loc ? loc : "");
-              int cat = 0;                                   // amplitude
-              if(s.find("FM") != std::string::npos)
-                  cat = 3;                                   // modulator envelopes
-              else if(s.find("Filter") != std::string::npos)
-                  cat = 2;
-              else if(s.find("Freq") != std::string::npos || s.find("BandWidth") != std::string::npos)
-                  cat = 1;
+              const int cat = env_category(loc);
               if(w->parent() != g_env) {
                   w->hide();
                   if(w->parent())
@@ -943,6 +1089,57 @@ jobs:
               w->position(g_env->x(), g_env->y());
               g_env_win[cat] = w;
               show_env_category(cat);
+          }
+
+          void zyn_env_select(void *key, const char *loc, int mode, Fl_Valuator *a_val, Fl_Valuator *a_dt,
+                              Fl_Valuator *d_val, Fl_Valuator *d_dt, Fl_Valuator *s_val, Fl_Valuator *r_val,
+                              Fl_Valuator *r_dt)
+          {
+              if(!key)
+                  return;
+              if(!g_env || !g_graph) {   // no strip on this screen: open the point editor like before
+                  ((EnvelopeUI *)key)->open_as_freemode();
+                  return;
+              }
+              const int cat = env_category(loc);
+              EnvSrc &s = g_src[cat];
+              s.key = key;
+              s.mode = mode;
+              s.v[0] = a_val; s.v[1] = a_dt; s.v[2] = d_val; s.v[3] = d_dt;
+              s.v[4] = s_val; s.v[5] = r_val; s.v[6] = r_dt;
+              s.loc = loc ? loc : "";
+              show_graph(cat);
+          }
+
+          void zyn_env_forget(void *key)
+          {
+              for(int i = 0; i < 4; ++i)
+                  if(g_src[i].key == key)
+                      g_src[i].key = 0;
+              if(g_graph)
+                  g_graph->redraw();
+          }
+
+          // formant filter editor / DynFilter filter window: shown in the FX tab
+          void zyn_embed_fx_filter(Fl_Window *w, int kind)
+          {
+              if(!w)
+                  return;
+              if(!g_fx) {
+                  w->show();
+                  return;
+              }
+              const char *prefix = kind == 0 ? "Formant Filter" : "Filter Parameters";
+              for(int i = 0; i < g_fx->children(); ++i) {
+                  Fl_Window *k = dynamic_cast<Fl_Window *>(g_fx->child(i));
+                  if(k && k != w && k->label() && !strncmp(k->label(), prefix, strlen(prefix)))
+                      k->hide();
+              }
+              if(kind == 0)
+                  embed_into(g_fx, w, g_fxp_x, g_fxp_y + 145 + PAD);
+              else
+                  embed_into(g_fx, w, g_fxp_x + 390 + PAD, g_fxp_y);
+              show_page(1);
           }
 
           // "Edit instrument" button of the part panel
@@ -1140,12 +1337,21 @@ jobs:
                   }
                   const int hx = PAD + 112 + 575 + 12;
                   Fl_Box *hint = new Fl_Box(hx, strip_y + 4, WIN_W - PAD - hx - 8, STRIP_H - 8,
-                                            "ENVELOPE EDITOR\n\nPress E on any envelope to see its graph here.\n"
-                                            "The tabs jump back to the last envelope\nyou opened of each kind.");
+                                            "ENVELOPE EDITOR\n\nPress E on any envelope: its graph follows the knobs.\n"
+                                            "Tabs switch between the last envelope\nyou picked of each kind.");
                   hint->box(FL_NO_BOX);
                   hint->labelcolor(fl_rgb_color(143, 167, 176));
                   hint->labelsize(12);
                   hint->align(FL_ALIGN_CENTER | FL_ALIGN_WRAP);
+                  g_graph = new EnvGraph(PAD + 112, strip_y + 2, 575, STRIP_H - 4);
+                  g_freebtn = new Fl_Button(hx + 20, strip_y + STRIP_H - 44, WIN_W - PAD - hx - 48, 32, "FREE MODE EDIT (points)");
+                  g_freebtn->box(FL_FLAT_BOX);
+                  g_freebtn->color(fl_rgb_color(22, 30, 40));
+                  g_freebtn->labelcolor(fl_rgb_color(215, 240, 230));
+                  g_freebtn->labelsize(12);
+                  g_freebtn->clear_visible_focus();
+                  g_freebtn->callback(env_free_cb);
+                  Fl::add_timeout(0.1, env_tick);
                   g_env = new EnvStrip(PAD + 112, strip_y + 2, 575, STRIP_H - 4);
                   g_env->end();
               }
@@ -1320,6 +1526,47 @@ jobs:
                 'zyn_trace("~PartUI: partfx");\npartfx->hide();\ndelete(partfx);')
           patch('src/UI/PartUI.fl', 'instrumentkitlist->hide();\ndelete(instrumentkitlist);',
                 'zyn_trace("~PartUI: kitlist");\ninstrumentkitlist->hide();\ndelete(instrumentkitlist);\nzyn_trace("~PartUI: kitlist deleted");')
+          def patch_n(path, old, new, n):
+              s = open(path).read()
+              assert s.count(old) == n, (path, old[:70], s.count(old))
+              open(path, 'w').write(s.replace(old, new))
+          # stage 6: formant filter + DynFilter windows in the FX tab
+          patch('src/UI/FilterUI.fl', 'decl {\\#include "Fl_Osc_Dial.H"} {public local',
+                'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "Fl_Osc_Dial.H"} {public local')
+          patch('src/UI/FilterUI.fl', 'callback {formantparswindow->show();}', 'callback {zyn_embed_fx_filter(formantparswindow,0);}')
+          patch('src/UI/EffUI.fl', 'decl {\\#include <stdlib.h>} {public local',
+                'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include <stdlib.h>} {public local')
+          patch('src/UI/EffUI.fl', 'callback {filterwindow->show();}', 'callback {zyn_embed_fx_filter(filterwindow,1);}')
+          # stage 6: E button selects the envelope for the live graph (knobs stay as they are)
+          patch_n('src/UI/EnvelopeUI.fl', 'callback {open_as_freemode();}', 'callback {env_pick();}', 5)
+          patch('src/UI/EnvelopeUI.fl', 'code {envwindow->hide();\nhide();', 'code {zyn_env_forget(this);\nenvwindow->hide();\nhide();')
+          patch('src/UI/EnvelopeUI.fl', '  Function {open_as_freemode()} {open',
+          '''  Function {env_pick()} {open
+            } {
+               code {
+              if (freemodehack->value()) {
+                  open_as_freemode();
+                  return;
+              }
+              std::string l = freemodeeditwindow->loc();
+              switch (Envmode) {
+                  case 3:
+                      zyn_env_select(this, l.c_str(), Envmode, e2aval, e2adt, NULL, NULL, NULL, e2rval, e2rdt);
+                      break;
+                  case 4:
+                      zyn_env_select(this, l.c_str(), Envmode, e3aval, e3adt, e3dval, e3ddt, NULL, e3rval, e3rdt);
+                      break;
+                  case 5:
+                      zyn_env_select(this, l.c_str(), Envmode, e4aval, e4adt, NULL, NULL, NULL, e4rval, e4rdt);
+                      break;
+                  default:
+                      zyn_env_select(this, l.c_str(), Envmode, NULL, e1adt, NULL, e1ddt, e1sval, NULL, e1rdt);
+                      break;
+              }
+          } {}
+            }
+            Function {open_as_freemode()} {open''')
+          print('stage 6 patches applied')
           print('unified ui stage 5 patches applied')
           PYEOF
       - name: Crash diagnostics (abort hook and exit markers)
