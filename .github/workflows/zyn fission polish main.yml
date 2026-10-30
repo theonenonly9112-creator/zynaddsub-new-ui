@@ -2278,42 +2278,145 @@ jobs:
           print('stage 9 patches applied')
           PYEOF
 
-      - name: "Stage 10 - mockup visual polish only: teal controls and typography"
+      - name: Stage 10 (knob and slider look, one UI font)
         run: |
           cd zynaddsubfx-3.0.3
+          cat > src/UI/ZynFont.cpp <<'FONTEOF'
+          // ZynFont.cpp - one UI font for the whole window.
+          // Default: Segoe UI (always present on Windows Vista/7).
+          // Change it with a file "zyn-font.txt" next to the exe/plugin (first line = font family name,
+          // e.g. Calibri, Tahoma, Trebuchet MS), or the environment variable ZYN_FONT.
+          // Put "classic" in the file to keep the old font.
+          // A font file named "zyn-font.ttf" next to the exe/plugin is loaded for this program only;
+          // put its family name in zyn-font.txt.
+          #include <FL/Fl.H>
+          #include <FL/fl_draw.H>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #ifdef _WIN32
+          #include <windows.h>
+          #endif
+
+          void zyn_apply_font(void)
+          {
+              static char family[128] = "Segoe UI";
+              static char name_regular[160];
+              static char name_bold[160];
+          #ifdef _WIN32
+              char dir[MAX_PATH];
+              dir[0] = '\0';
+              if(GetModuleFileNameA(NULL, dir, MAX_PATH)) {
+                  char *slash = strrchr(dir, '\\');
+                  if(slash)
+                      slash[1] = '\0';
+                  else
+                      dir[0] = '\0';
+              }
+
+              char path[MAX_PATH + 32];
+              snprintf(path, sizeof(path), "%szyn-font.ttf", dir);
+              if(GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES)
+                  AddFontResourceExA(path, FR_PRIVATE, 0);
+
+              snprintf(path, sizeof(path), "%szyn-font.txt", dir);
+              if(FILE *f = fopen(path, "r")) {
+                  char line[128];
+                  if(fgets(line, sizeof(line), f)) {
+                      size_t n = strlen(line);
+                      while(n && (line[n - 1] == '\n' || line[n - 1] == '\r' || line[n - 1] == ' '))
+                          line[--n] = '\0';
+                      if(n)
+                          snprintf(family, sizeof(family), "%s", line);
+                  }
+                  fclose(f);
+              }
+          #endif
+              const char *env = getenv("ZYN_FONT");
+              if(env && env[0])
+                  snprintf(family, sizeof(family), "%s", env);
+              if(!strcmp(family, "classic"))
+                  return;
+
+              // FLTK font names start with a style letter: ' ' regular, 'B' bold
+              snprintf(name_regular, sizeof(name_regular), " %s", family);
+              snprintf(name_bold, sizeof(name_bold), "B%s", family);
+              Fl::set_font(FL_HELVETICA, name_regular);
+              Fl::set_font(FL_HELVETICA_BOLD, name_bold);
+              fprintf(stderr, "[UI] font: %s\n", family);
+          }
+          FONTEOF
+          cat > /tmp/newdraw.txt <<'DRAWEOF'
+          void WidgetPDial::draw()
+          {
+          #ifdef NTK_GUI
+              box( FL_NO_BOX );
+
+              Fl_Dial::draw();
+
+              return;
+          #else
+              const int cx = x(), cy = y(), sx = w(), sy = h();
+              const double a1 = angle1(), a2 = angle2();
+              const double val = (value() - minimum()) / (maximum() - minimum());
+              // even radius produces less artifacts if no antialiasing is avail
+              const int rad = (sx > sy ? sy : sx) &~1;
+
+              /* dark body with a thin light rim (flat, like the mockup) */
+              pdialcolor(6, 9, 13);
+              fl_pie(cx - 1, cy - 1, rad + 2, rad + 2, 0, 360);
+              pdialcolor(44, 56, 70);
+              fl_pie(cx, cy, rad, rad, 0, 360);
+              if (rad > 6) {
+                  pdialcolor(26, 34, 44);
+                  fl_pie(cx + 2, cy + 2, rad - 4, rad - 4, 0, 360);
+              }
+              if (rad > 14) {
+                  pdialcolor(18, 24, 32);
+                  fl_pie(cx + rad / 4, cy + rad / 4, rad - rad / 2, rad - rad / 2, 0, 360);
+              }
+
+              /* full range track, then the value arc on top of it */
+              const double a = -(a2 - a1) * val - a1;
+              fl_line_style(FL_SOLID, rad >= 24 ? 3 : 2, 0);
+              pdialcolor(52, 64, 78);
+              fl_arc(cx + 2, cy + 2, rad - 4, rad - 4, -a2 - 90, a1 - 180);
+              pdialcolor(0, 215, 120);
+              fl_arc(cx + 2, cy + 2, rad - 4, rad - 4, a - 90, a1 - 180);
+
+              /* pointer */
+              const double t = (a - 90.0) * 3.14159265358979 / 180.0;
+              const double dx = cos(t), dy = -sin(t);
+              const double r1 = rad * 0.16, r2 = rad * 0.34;
+              fl_line_style(FL_SOLID, 2, 0);
+              pdialcolor(225, 245, 255);
+              fl_line(cx + rad / 2 + (int)(dx * r1 + 0.5), cy + rad / 2 + (int)(dy * r1 + 0.5),
+                      cx + rad / 2 + (int)(dx * r2 + 0.5), cy + rad / 2 + (int)(dy * r2 + 0.5));
+              fl_line_style(0);
+          #endif
+          }
+          DRAWEOF
           python3 - <<'PYEOF'
-          from pathlib import Path
-
-          def patch(path, old, new, expected=1):
-              p = Path(path)
-              s = p.read_text()
-              count = s.count(old)
-              if count != expected:
-                  raise SystemExit(f"UI polish patch mismatch in {path}: expected {expected}, found {count}: {old!r}")
-              p.write_text(s.replace(old, new))
-
-          # Rotary-dial palette: move the existing custom knob drawing from green to the
-          # mockup's muted teal/navy palette. This only changes paint colours.
-          W = 'src/UI/WidgetPDial.cpp'
-          patch(W, 'pdialcolor(6, 24, 14);', 'pdialcolor(8, 28, 32);')
-          patch(W, 'fl_color(30, 150, 80);', 'fl_color(24, 132, 142);')
-          patch(W, 'pdialcolor(16, 84, 48);', 'pdialcolor(18, 76, 84);')
-          patch(W, 'pdialcolor(22, 110, 64);', 'pdialcolor(26, 112, 122);')
-          patch(W, 'pdialcolor(200, 255, 220);', 'pdialcolor(190, 242, 238);')
-
-          # Consistent typography for the unified shell. Keep existing button weights,
-          # but use a clean Helvetica face and slightly tighter, readable labels.
-          C = 'src/UI/UnifiedShell.cpp'
-          patch(C, '              if(!g_theme || !w)\n                  return;\n              Fl_Group *g = w->as_group();',
-                   '              if(!g_theme || !w)\n                  return;\n              w->labelfont(FL_HELVETICA);\n              if(w->labelsize() <= 0 || w->labelsize() > 14)\n                  w->labelsize(12);\n              Fl_Group *g = w->as_group();')
-          # Keep section/action buttons visually stronger than regular parameter labels.
-          patch(C, '              } else if(dynamic_cast<Fl_Button *>(w)) {\n                  if(fill_box(w->box()) && stock_gray(w->color()))',
-                   '              } else if(dynamic_cast<Fl_Button *>(w)) {\n                  w->labelfont(FL_HELVETICA_BOLD);\n                  if(w->labelsize() > 14) w->labelsize(14);\n                  if(fill_box(w->box()) && stock_gray(w->color()))')
-          patch(C, '              } else if(Fl_Value_Slider *vs = dynamic_cast<Fl_Value_Slider *>(w)) {\n                  vs->textcolor(C_TEXT());\n                  if(stock_gray(vs->color()))\n                      vs->color(fl_rgb_color(50, 64, 80));',
-                   '              } else if(Fl_Value_Slider *vs = dynamic_cast<Fl_Value_Slider *>(w)) {\n                  vs->textcolor(C_TEXT());\n                  vs->selection_color(fl_rgb_color(24, 132, 142));\n                  if(stock_gray(vs->color()))\n                      vs->color(fl_rgb_color(38, 54, 68));')
-          patch(C, '              } else if(Fl_Slider *sl = dynamic_cast<Fl_Slider *>(w)) {\n                  if(stock_gray(sl->color()))\n                      sl->color(fl_rgb_color(50, 64, 80));',
-                   '              } else if(Fl_Slider *sl = dynamic_cast<Fl_Slider *>(w)) {\n                  sl->selection_color(fl_rgb_color(24, 132, 142));\n                  if(stock_gray(sl->color()))\n                      sl->color(fl_rgb_color(38, 54, 68));')
-          print('stage 10 UI-only polish patches applied')
+          def patch(path, old, new):
+              s = open(path).read()
+              assert s.count(old) == 1, (path, old[:60], s.count(old))
+              open(path, 'w').write(s.replace(old, new))
+          # knobs: flat dark body, thin track, green value arc, light pointer
+          p = 'src/UI/WidgetPDial.cpp'
+          s = open(p).read()
+          a = s.index('void WidgetPDial::draw()')
+          b = s.index('void WidgetPDial::pdialcolor(')
+          s = s[:a] + open('/tmp/newdraw.txt').read() + s[b:]
+          open(p, 'w').write(s)
+          # font file is built with the UI library
+          patch('src/UI/CMakeLists.txt', '        UnifiedShell.cpp\n', '        UnifiedShell.cpp\n        ZynFont.cpp\n')
+          patch('src/UI/UnifiedShell.cpp', '#include "UnifiedShell.h"\n', '#include "UnifiedShell.h"\nvoid zyn_apply_font(void);\n')
+          patch('src/UI/UnifiedShell.cpp', '    g_ui = ui;\n', '    g_ui = ui;\n    zyn_apply_font();\n')
+          # sliders: thin flat track, green handle
+          patch('src/UI/UnifiedShell.cpp',
+                '    } else if(Fl_Slider *sl = dynamic_cast<Fl_Slider *>(w)) {\n        if(stock_gray(sl->color()))\n            sl->color(fl_rgb_color(50, 64, 80));\n',
+                '    } else if(Fl_Slider *sl = dynamic_cast<Fl_Slider *>(w)) {\n        sl->slider(FL_FLAT_BOX);\n        sl->color(fl_rgb_color(16, 22, 30));\n        sl->selection_color(fl_rgb_color(0, 215, 120));\n')
+          print('stage 10 patches applied')
           PYEOF
 
       - name: Configure
