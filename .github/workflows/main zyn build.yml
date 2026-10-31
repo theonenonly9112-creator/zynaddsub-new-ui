@@ -2419,6 +2419,30 @@ jobs:
           print('stage 10 patches applied')
           PYEOF
 
+      - name: Stage 11 (rename to ZYNADDSUBFX NEO MATRIX EDITION / ZYNNM XT)
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def patch(path, old, new, n=1):
+              s = open(path).read()
+              assert s.count(old) == n, (path, old[:60], s.count(old), n)
+              open(path, 'w').write(s.replace(old, new))
+          LONG = 'ZYNADDSUBFX NEO MATRIX EDITION'
+          SHORT = 'ZYNNM XT'
+          # logo in the tab bar (short name)
+          patch('src/UI/UnifiedShell.cpp', '"ZYNADDSUBFX"', '"' + SHORT + '"')
+          # window titles (long name)
+          patch('src/UI/MasterUI.fl', 'label ZynAddSubFX\n', 'label {' + LONG + '}\n', 2)
+          patch('src/UI/MasterUI.fl', 'label {ZynAddSubFX Panel}', 'label {' + SHORT + ' Panel}')
+          patch('src/UI/MasterUI.fl', '"%s - ZynAddSubFX"', '"%s - ' + SHORT + '"')
+          patch('src/UI/MasterUI.fl', '"%s","ZynAddSubFX"', '"%s","' + LONG + '"')
+          # plugin name shown by the host (file names and the plugin ID stay the same)
+          patch('src/Plugin/ZynAddSubFX/DistrhoPluginInfo.h', '#define DISTRHO_PLUGIN_BRAND "ZynAddSubFX"', '#define DISTRHO_PLUGIN_BRAND "' + SHORT + '"')
+          patch('src/Plugin/ZynAddSubFX/DistrhoPluginInfo.h', '#define DISTRHO_PLUGIN_NAME  "ZynAddSubFX"', '#define DISTRHO_PLUGIN_NAME  "' + SHORT + '"')
+          patch('src/Plugin/ZynAddSubFX/ZynAddSubFX.cpp', 'return "ZynAddSubFX";', 'return "' + SHORT + '";')
+          print('rename applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
