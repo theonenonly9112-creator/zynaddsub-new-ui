@@ -35,7 +35,7 @@ jobs:
           mkdir -p $HOME/deps && cd $HOME/deps
           curl -fLO https://www.fftw.org/fftw-3.3.10.tar.gz
           tar xzf fftw-3.3.10.tar.gz && cd fftw-3.3.10
-          ./configure --prefix=/mingw32 --enable-shared --disable-static --with-our-malloc --disable-fortran
+          ./configure --prefix=/mingw32 --enable-shared --enable-static --with-our-malloc --disable-fortran
           make -j4 && make install
       - name: Build mxml
         run: |
@@ -64,7 +64,7 @@ jobs:
           cd $HOME/deps
           curl -fLO https://github.com/radarsat1/liblo/releases/download/0.32/liblo-0.32.tar.gz
           tar xzf liblo-0.32.tar.gz && cd liblo-0.32
-          ./configure --prefix=/mingw32 --enable-shared --disable-static --disable-tests --disable-examples --disable-tools
+          ./configure --prefix=/mingw32 --enable-shared --enable-static --disable-tests --disable-examples --disable-tools
           make -j4 && make install
       - name: Build fltk
         run: |
@@ -2419,28 +2419,56 @@ jobs:
           print('stage 10 patches applied')
           PYEOF
 
-      - name: Stage 11 (rename to ZYNADDSUBFX NEO MATRIX EDITION / ZYNNM XT)
+      - name: Stage 11 (rename everything to ZYNNM XT)
         run: |
           cd zynaddsubfx-3.0.3
           python3 - <<'PYEOF'
-          def patch(path, old, new, n=1):
-              s = open(path).read()
-              assert s.count(old) == n, (path, old[:60], s.count(old), n)
-              open(path, 'w').write(s.replace(old, new))
-          LONG = 'ZYNADDSUBFX NEO MATRIX EDITION'
-          SHORT = 'ZYNNM XT'
-          # logo in the tab bar (short name)
-          patch('src/UI/UnifiedShell.cpp', '"ZYNADDSUBFX"', '"' + SHORT + '"')
-          # window titles (long name)
-          patch('src/UI/MasterUI.fl', 'label ZynAddSubFX\n', 'label {' + LONG + '}\n', 2)
-          patch('src/UI/MasterUI.fl', 'label {ZynAddSubFX Panel}', 'label {' + SHORT + ' Panel}')
-          patch('src/UI/MasterUI.fl', '"%s - ZynAddSubFX"', '"%s - ' + SHORT + '"')
-          patch('src/UI/MasterUI.fl', '"%s","ZynAddSubFX"', '"%s","' + LONG + '"')
-          # plugin name shown by the host (file names and the plugin ID stay the same)
-          patch('src/Plugin/ZynAddSubFX/DistrhoPluginInfo.h', '#define DISTRHO_PLUGIN_BRAND "ZynAddSubFX"', '#define DISTRHO_PLUGIN_BRAND "' + SHORT + '"')
-          patch('src/Plugin/ZynAddSubFX/DistrhoPluginInfo.h', '#define DISTRHO_PLUGIN_NAME  "ZynAddSubFX"', '#define DISTRHO_PLUGIN_NAME  "' + SHORT + '"')
-          patch('src/Plugin/ZynAddSubFX/ZynAddSubFX.cpp', 'return "ZynAddSubFX";', 'return "' + SHORT + '";')
-          print('rename applied')
+          def rd(p):
+              return open(p).read()
+
+          def wr(p, s):
+              open(p, 'w').write(s)
+
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          NAME = 'ZYNNM XT'
+
+          # ---------------------------------------------------------------- window / dialog texts of the user interface
+          MU = 'src/UI/MasterUI.fl'
+          sub1(MU, '      label zynaddsubfx\n', '      label {%s}\n' % NAME)
+          sub1(MU, '        label ZynAddSubFX\n', '        label {%s}\n' % NAME)
+          sub1(MU, '      label ZynAddSubFX\n', '      label {%s}\n' % NAME)
+          sub1(MU, 'label {ZynAddSubFX Panel}', 'label {%s Panel}' % NAME)
+          sub1(MU, 'Welcome to ZynAddSubFX', 'Welcome to %s' % NAME)
+          sub1(MU, 'if you have used ZynAddSubFX before', 'if you have used %s before' % NAME)
+          sub1(MU, 'Most functionality of ZynAddSubFX will be hidden', 'Most functionality of %s will be hidden' % NAME)
+          sub1(MU, '%s - ZynAddSubFX', '%s - ' + NAME)
+          sub1(MU, '"%s","ZynAddSubFX")', '"%s","' + NAME + '")')
+          sub1('src/UI/ConfigUI.fl', 'label {ZynAddSubFX Settings}', 'label {%s Settings}' % NAME)
+          sub1('src/UI/ConfigUI.fl', 'only after ZynAddSubFX is restarted', 'only after %s is restarted' % NAME)
+          sub1('src/UI/VirKeyboard.fl', 'label {Virtual Keyboard - ZynAddSubFX}', 'label {Virtual Keyboard - %s}' % NAME)
+          sub1('src/UI/UnifiedShell.cpp', '"ZYNADDSUBFX"', '"%s"' % NAME)
+
+          # ---------------------------------------------------------------- the plugin as the host sees it
+          sub1('src/Plugin/ZynAddSubFX/DistrhoPluginInfo.h', '#define DISTRHO_PLUGIN_BRAND "ZynAddSubFX"', '#define DISTRHO_PLUGIN_BRAND "%s"' % NAME)
+          sub1('src/Plugin/ZynAddSubFX/DistrhoPluginInfo.h', '#define DISTRHO_PLUGIN_NAME  "ZynAddSubFX"', '#define DISTRHO_PLUGIN_NAME  "%s"' % NAME)
+          # the label may only contain _ a-z A-Z 0-9
+          sub1('src/Plugin/ZynAddSubFX/ZynAddSubFX.cpp', 'return "ZynAddSubFX";', 'return "ZYNNM_XT";')
+          sub1('src/Plugin/ZynAddSubFX/ZynAddSubFX.cpp', 'return "ZynAddSubFX Team";', 'return "%s";' % NAME)
+          sub1('src/Plugin/ZynAddSubFX/ZynAddSubFX-UI.cpp', 'setTitle("ZynAddSubFX");', 'setTitle("%s");' % NAME)
+
+          # ---------------------------------------------------------------- the editor panel inside the plugin window
+          VE = 'DPF/distrho/src/zyn_vst_editor.h'
+          sub1(VE, '"ZynAddSubFX editor"', '"%s editor"' % NAME)
+          sub1(VE, '"%szynaddsubfx-ext-gui.exe"', '"%sZYNNM-XT-editor.exe"')
+          sub1(VE, '--title \\"ZynAddSubFX\\"', '--title \\"%s\\"' % NAME)
+          sub1(VE, 'Could not start zynaddsubfx-ext-gui.exe.', 'Could not start ZYNNM-XT-editor.exe.')
+          sub1(VE, '"ZynAddSubFX", MB_OK', '"%s", MB_OK' % NAME)
+          print('stage 11 patches applied')
           PYEOF
 
       - name: Configure
@@ -2479,6 +2507,29 @@ jobs:
           tail -n 15 ../../build-vst.log
           echo "ninja exit code: $STATUS"
           exit $STATUS
+      - name: Single-file plugin for LMMS (static link, optional)
+        continue-on-error: true
+        run: |
+          cd zynaddsubfx-3.0.3/build
+          set +e
+          mkdir -p ../../stash
+          DYN=$(find . -name ZynAddSubFX.dll | head -n 1)
+          if [ -z "$DYN" ]; then echo "no plugin dll, skipping"; exit 0; fi
+          cp "$DYN" ../../stash/ZynAddSubFX-dynamic.dll
+          cmake . -DCMAKE_SHARED_LINKER_FLAGS="-static -static-libgcc -static-libstdc++" \
+            -DCMAKE_CXX_STANDARD_LIBRARIES="-lws2_32 -liphlpapi -lwinmm" > ../../cmake-static.log 2>&1
+          ninja ZynAddSubFX_vst > ../../build-static.log 2>&1
+          STATUS=$?
+          echo "================ STATIC PLUGIN: LAST 15 LINES ================"
+          tail -n 15 ../../build-static.log
+          grep -n -E "error:|undefined reference|cannot find" ../../build-static.log | head -20
+          if [ $STATUS -eq 0 ]; then
+            cp "$DYN" ../../stash/ZynAddSubFX-static.dll
+            echo "===== files the single-file plugin still needs ====="
+            objdump -p ../../stash/ZynAddSubFX-static.dll | grep "DLL Name"
+          fi
+          cp ../../stash/ZynAddSubFX-dynamic.dll "$DYN"
+          exit 0
       - name: Collect files
         run: |
           mkdir -p out
@@ -2507,6 +2558,15 @@ jobs:
             cp "$GUIEXE" out/vst/
             copydeps out/vst/zynaddsubfx-ext-gui.exe out/vst
           fi
+          if [ -f stash/ZynAddSubFX-static.dll ]; then
+            mkdir -p out/vst-lmms
+            cp stash/ZynAddSubFX-static.dll "out/vst-lmms/ZYNNM XT.dll"
+            if [ -n "$GUIEXE" ]; then
+              cp "$GUIEXE" out/vst-lmms/ZYNNM-XT-editor.exe
+              copydeps out/vst-lmms/ZYNNM-XT-editor.exe out/vst-lmms
+            fi
+            strip --strip-debug "out/vst-lmms/ZYNNM XT.dll" 2>/dev/null || true
+          fi
           cp -r zynaddsubfx-3.0.3/instruments out/ || true
           cp -r zynaddsubfx-3.0.3/pixmaps out/ || true
           # keep unstripped copies for addr2line; shipped files keep their symbol table so crash logs show function names
@@ -2520,12 +2580,15 @@ jobs:
           (cd debug && zip -r ../zyn-debug-symbols.zip . ) || true
           echo "===== FILES IN ZIP ====="
           ls -R out | head -n 60
-          cd out && zip -r ../zynaddsubfx-win32.zip .
+          mv out/zynaddsubfx.exe "out/ZYNNM XT.exe"
+          if [ -f out/vst/ZynAddSubFX.dll ]; then mv out/vst/ZynAddSubFX.dll "out/vst/ZYNNM XT.dll"; fi
+          if [ -f out/vst/zynaddsubfx-ext-gui.exe ]; then mv out/vst/zynaddsubfx-ext-gui.exe out/vst/ZYNNM-XT-editor.exe; fi
+          cd out && zip -r ../ZYNNM-XT-win32.zip .
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: zynaddsubfx-win32
-          path: zynaddsubfx-win32.zip
+          name: ZYNNM-XT-win32
+          path: ZYNNM-XT-win32.zip
       - uses: actions/upload-artifact@v4
         if: always()
         with:
