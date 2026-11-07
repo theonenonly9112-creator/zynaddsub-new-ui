@@ -1,4 +1,4 @@
-name: Build Windows 32-bit
+name: Build Windows 32-bit (ZYNNM XT stage 12)
 
 on:
   workflow_dispatch:
@@ -64,6 +64,19 @@ jobs:
           cd $HOME/deps
           curl -fLO https://github.com/radarsat1/liblo/releases/download/0.32/liblo-0.32.tar.gz
           tar xzf liblo-0.32.tar.gz && cd liblo-0.32
+          # ZYNNM fix 1: bind the OSC server socket to loopback (127.0.0.1)
+          # instead of 0.0.0.0, so the plugin never "acts as a server on the
+          # network" and firewall/antivirus software (K7 etc.) stops prompting
+          # on UDP port 18868. liblo 0.32 has no API for a unicast bind
+          # address, so patch its socket creation directly (anchor occurs
+          # exactly once in src/server.c).
+          sed -i 's|ret = getaddrinfo(NULL, service, &hints, &ai);|ret = getaddrinfo("127.0.0.1", service, \&hints, \&ai);|' src/server.c
+          # ZYNNM fix 2: report osc.udp://localhost:PORT/ as the server URL so
+          # the editor UI connects to the loopback-bound socket.
+          sed -i 's|gethostname(hostname, sizeof(hostname));|strcpy(hostname, "localhost");|' src/server.c
+          grep -q 'getaddrinfo("127.0.0.1", service' src/server.c || { echo "::error::liblo loopback patch did not apply"; exit 1; }
+          grep -q 'strcpy(hostname, "localhost")' src/server.c || { echo "::error::liblo hostname patch did not apply"; exit 1; }
+          echo "liblo loopback patches applied"
           ./configure --prefix=/mingw32 --enable-shared --enable-static --disable-tests --disable-examples --disable-tools
           make -j4 && make install
       - name: Build fltk
@@ -2583,7 +2596,57 @@ jobs:
           mv out/zynaddsubfx.exe "out/ZYNNM XT.exe"
           if [ -f out/vst/ZynAddSubFX.dll ]; then mv out/vst/ZynAddSubFX.dll "out/vst/ZYNNM XT.dll"; fi
           if [ -f out/vst/zynaddsubfx-ext-gui.exe ]; then mv out/vst/zynaddsubfx-ext-gui.exe out/vst/ZYNNM-XT-editor.exe; fi
+          cat > out/README.txt <<'RDEOF'
+          ZYNNM XT - which file goes where
+
+          vst-lmms/ZYNNM XT.dll         <- load THIS file in LMMS VeSTige. It needs no
+                                           extra DLLs. Keep ZYNNM-XT-editor.exe in the
+                                           same folder, it draws the editor window.
+          vst/ZYNNM XT.dll              <- for FL Studio 32-bit. Keep every other file
+                                           from the vst folder next to it (it needs them).
+          ZYNNM XT.exe                  <- standalone version, run by itself.
+
+          The editor and the synth engine talk to each other on 127.0.0.1 (localhost)
+          only. No data leaves your PC and no firewall prompt is needed.
+          RDEOF
           cd out && zip -r ../ZYNNM-XT-win32.zip .
+      - name: Verify plugin dependencies (LMMS DLL must be self-contained)
+        run: |
+          SYSTEM_DLLS="kernel32.dll user32.dll gdi32.dll ws2_32.dll iphlpapi.dll winmm.dll shell32.dll ole32.dll oleaut32.dll advapi32.dll comctl32.dll comdlg32.dll msvcrt.dll imm32.dll wsock32.dll"
+          FAIL=0
+          if [ ! -f "out/vst-lmms/ZYNNM XT.dll" ]; then
+            echo "::error::out/vst-lmms/ZYNNM XT.dll is MISSING - the static 'Single-file plugin for LMMS' build failed. THIS is the file LMMS VeSTige must load; without it VeSTige fails silently. Read the 'Single-file plugin for LMMS' log above."
+            FAIL=1
+          else
+            echo "===== imports of out/vst-lmms/ZYNNM XT.dll (must all be Windows system DLLs) ====="
+            for dll in $(objdump -p "out/vst-lmms/ZYNNM XT.dll" | grep "DLL Name" | awk '{print $3}'); do
+              low=$(echo "$dll" | tr 'A-Z' 'a-z')
+              ok=""
+              for s2 in $SYSTEM_DLLS; do
+                if [ "$low" = "$s2" ]; then ok=1; break; fi
+              done
+              if [ -n "$ok" ]; then
+                echo "  system  $dll"
+              else
+                echo "::error::out/vst-lmms/ZYNNM XT.dll imports $dll, which is NOT a Windows system DLL - LMMS VeSTige fails to load such a DLL silently. Fix static linking or bundle the DLL next to it."
+                FAIL=1
+              fi
+            done
+          fi
+          if [ -f "out/vst-lmms/ZYNNM-XT-editor.exe" ]; then
+            echo "editor exe present next to the LMMS plugin: yes"
+          else
+            echo "::warning::out/vst-lmms/ZYNNM-XT-editor.exe missing - VeSTige GUI button will show an error instead of the editor"
+          fi
+          echo "===== imports of the dynamic FL DLL (informational) ====="
+          if [ -f "out/vst/ZYNNM XT.dll" ]; then
+            objdump -p "out/vst/ZYNNM XT.dll" | grep "DLL Name" || true
+          fi
+          if [ "$FAIL" -ne 0 ]; then
+            echo "::error::dependency audit FAILED - see messages above"
+            exit 1
+          fi
+          echo "dependency audit PASSED"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
