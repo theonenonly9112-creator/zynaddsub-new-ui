@@ -2613,6 +2613,186 @@ jobs:
           print('subsynth zero-harmonic fix applied')
           PYEOF
 
+      - name: "Stage 13 (.zwav waveform files on the oscillator C and P buttons, 8 new base waveforms)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # ---- 1. .zwav: waveform files (the oscillator's C and P buttons) ------------------------------------
+          P = 'src/Params/PresetsStore.cpp'
+          sub1(P, '#include <sys/stat.h>\n',
+               '''#include <sys/stat.h>
+          #ifdef _WIN32
+          #include <direct.h>
+          #endif
+          ''')
+          sub1(P, 'namespace zyn {\n\n//XXX to remove',
+               '''namespace zyn {
+
+          // ZYNNM XT waveform files (.zwav) live in one folder:
+          //   Windows: %USERPROFILE%\\ZYNNM XT\\Waveforms      other systems: $HOME/ZYNNM XT/Waveforms
+          //   (the environment variable ZYNNM_WAVEFORMS can point somewhere else)
+          static void zwavMkdir(const std::string &p)
+          {
+          #ifdef _WIN32
+              _mkdir(p.c_str());
+          #else
+              mkdir(p.c_str(), 0755);
+          #endif
+          }
+
+          static std::string zwavDir()
+          {
+              static std::string dir;
+              if(!dir.empty())
+                  return dir;
+              const char *env = getenv("ZYNNM_WAVEFORMS");
+              if(env && *env) {
+                  dir = env;
+                  zwavMkdir(dir);
+                  return dir;
+              }
+          #ifdef _WIN32
+              const char *home = getenv("USERPROFILE");
+              const char  sep  = '\\\\';
+          #else
+              const char *home = getenv("HOME");
+              const char  sep  = '/';
+          #endif
+              std::string base = home ? home : ".";
+              base += sep;
+              base += "ZYNNM XT";
+              zwavMkdir(base);
+              dir = base + sep + "Waveforms";
+              zwavMkdir(dir);
+              return dir;
+          }
+
+          //XXX to remove''')
+          sub1(P, '    //sort the presets\n',
+               '''    //waveform files (.zwav): listed as oscillator presets
+              {
+                  const string zdir = zwavDir();
+                  DIR *dir = opendir(zdir.c_str());
+                  if(dir) {
+                      struct dirent *fn;
+                      while((fn = readdir(dir))) {
+                          const string filename = fn->d_name;
+                          const size_t n = filename.size();
+                          if(n <= 5 || filename.compare(n - 5, 5, ".zwav") != 0)
+                              continue;
+                          presets.push_back(presetstruct{zdir + "/" + filename,
+                                                         filename.substr(0, n - 5), "oscilgen"});
+                      }
+                      closedir(dir);
+                  }
+              }
+
+              //sort the presets
+          ''')
+          sub1(P, '    name = legalizeFilename(name);\n',
+               '''    name = legalizeFilename(name);
+
+              //an oscillator is saved as a waveform file: plain XML, the whole oscillator
+              //(base function, custom base wave, harmonics, modulation, waveshaping, filter)
+              if(!strcmp(type, "Poscilgen")) {
+                  xml.saveXMLfile(zwavDir() + "/" + name + ".zwav", 0);
+                  return;
+              }
+          ''')
+
+          # ---- 2. new base waveforms ----------------------------------------------------------------------------
+          O = 'src/Synth/OscilGen.cpp'
+          sub1(O, 'typedef float (*base_func)(float, float);\n\nbase_func getBaseFunction',
+               '''// ---- ZYNNM XT base waveforms (a = 0..1, 0.5 is the default shape) ----
+          FUNC(organ)      // drawbar-style sum of the first harmonics, a = brightness
+          {
+              float p = 2.0f * PI * x;
+              float w = a * 2.0f;
+              float s = sinf(p) + w * (0.7f * sinf(2 * p) + 0.5f * sinf(3 * p)
+                                       + 0.35f * sinf(4 * p) + 0.25f * sinf(6 * p) + 0.18f * sinf(8 * p));
+              return s / (1.0f + w * 2.0f);
+          }
+
+          FUNC(softsqr)    // rounded square, a = how square
+          {
+              float k = 1.0f + a * a * 30.0f;
+              return tanhf(k * sinf(2.0f * PI * x)) / tanhf(k);
+          }
+
+          FUNC(formant)    // windowed sine, a = which harmonic is stressed (1..16)
+          {
+              int   n = 1 + (int)(a * 15.0f);
+              float w = 0.5f - 0.5f * cosf(2.0f * PI * x);
+              return sinf(2.0f * PI * n * x) * w;
+          }
+
+          FUNC(hardsync)   // saw with hard sync, a = sync ratio (1..8)
+          {
+              float r = 1.0f + a * 7.0f;
+              return 2.0f * fmodf(x * r, 1.0f) - 1.0f;
+          }
+
+          FUNC(bell)       // 1:3 FM bell, a = FM amount
+          {
+              float p = 2.0f * PI * x;
+              return sinf(p + a * 6.0f * sinf(3.0f * p));
+          }
+
+          FUNC(steps)      // stair-stepped sine, a = number of steps (2..16)
+          {
+              float l = 2.0f + floorf(a * 14.0f);
+              return floorf(sinf(2.0f * PI * x) * l + 0.5f) / l;
+          }
+
+          FUNC(fold)       // wave folder, a = fold amount
+          {
+              return sinf((0.5f + a * 8.0f) * sinf(2.0f * PI * x));
+          }
+
+          FUNC(sinesaw)    // morph from sine (a=0) to saw (a=1)
+          {
+              float s = sinf(2.0f * PI * x);
+              float w = 2.0f * fmodf(x + 0.5f, 1.0f) - 1.0f;
+              return s * (1.0f - a) + w * a;
+          }
+
+          typedef float (*base_func)(float, float);
+
+          base_func getBaseFunction''')
+          sub1(O, 'assert(func < 15);', 'assert(func < 23);')
+          sub1(O, '        basefunc_circle,\n    };',
+               '''        basefunc_circle,
+                  basefunc_organ,
+                  basefunc_softsqr,
+                  basefunc_formant,
+                  basefunc_hardsync,
+                  basefunc_bell,
+                  basefunc_steps,
+                  basefunc_fold,
+                  basefunc_sinesaw,
+              };''')
+          sub1(O, 'spike, circle), rOpt(127,use-as-base waveform),',
+               'spike, circle, organ, softsqr, formant, hardsync, bell, steps, fold, sinesaw), rOpt(127,use-as-base waveform),')
+
+          # the menu: new entries go before the hidden "User" entry (the editor finds User as size()-2)
+          F = 'src/UI/OscilGenUI.fl'
+          items = ''
+          for lab in ['Organ', 'SoftSqr', 'Formant', 'HardSync', 'Bell', 'Steps', 'Fold', 'SineSaw']:
+              items += '            MenuItem {} {\n              label %s\n              xywh {127 127 100 20} labelfont 1 labelsize 11\n            }\n' % lab
+          sub1(F, '\t    MenuItem {} {\n\t      label User', items + '\t    MenuItem {} {\n\t      label User')
+          print('stage 13 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
@@ -2722,6 +2902,18 @@ jobs:
           (cd debug && zip -r ../zyn-debug-symbols.zip . ) || true
           echo "===== FILES IN ZIP ====="
           ls -R out | head -n 60
+          # every exe and dll in every folder must find its DLLs next to it (the single-file plugin was never checked)
+          echo "===== dependency check ====="
+          for f in out/*.exe out/vst/*.exe out/vst/*.dll out/vst-lmms/*.exe out/vst-lmms/*.dll; do
+            [ -f "$f" ] || continue
+            d=$(dirname "$f")
+            for dll in $(objdump -p "$f" | grep "DLL Name" | awk '{print $3}'); do
+              if [ ! -f "$d/$dll" ] && [ -f "/mingw32/bin/$dll" ]; then
+                echo "was missing next to $f: $dll (bundled now)"
+                copydeps "$f" "$d"
+              fi
+            done
+          done
           mv out/zynaddsubfx.exe "out/ZYNNM XT.exe"
           if [ -f out/vst/ZynAddSubFX.dll ]; then mv out/vst/ZynAddSubFX.dll "out/vst/ZYNNM XT.dll"; fi
           if [ -f out/vst/zynaddsubfx-ext-gui.exe ]; then mv out/vst/zynaddsubfx-ext-gui.exe out/vst/ZYNNM-XT-editor.exe; fi
