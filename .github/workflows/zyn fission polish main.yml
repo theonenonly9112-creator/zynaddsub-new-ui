@@ -28,7 +28,6 @@ jobs:
             mingw-w64-i686-cmake
             mingw-w64-i686-ninja
             mingw-w64-i686-zlib
-            mingw-w64-i686-portaudio
             mingw-w64-i686-pkgconf
       - name: Build fftw
         run: |
@@ -37,6 +36,15 @@ jobs:
           tar xzf fftw-3.3.10.tar.gz && cd fftw-3.3.10
           ./configure --prefix=/mingw32 --enable-shared --enable-static --with-our-malloc --disable-fortran
           make -j4 && make install
+      - name: Build portaudio
+        run: |
+          # MSYS2 no longer ships mingw-w64-i686-portaudio, so it is built here like fftw
+          cd $HOME/deps
+          curl -fLO https://files.portaudio.com/archives/pa_stable_v190700_20210406.tgz
+          tar xzf pa_stable_v190700_20210406.tgz && cd portaudio
+          ./configure --prefix=/mingw32 --enable-shared --enable-static --disable-cxx --with-winapi=wmme,directx
+          make -j4 && make install
+          ls /mingw32/lib/pkgconfig/portaudio-2.0.pc
       - name: Build mxml
         run: |
           cd $HOME/deps
