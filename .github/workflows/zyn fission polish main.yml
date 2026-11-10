@@ -2782,8 +2782,10 @@ jobs:
                   basefunc_sinesaw,
               };''')
           sub1(O, 'spike, circle), rOpt(127,use-as-base waveform),',
-               'spike, circle, organ, softsqr, formant, hardsync, bell, steps, fold, sinesaw), rOpt(127,use-as-base waveform),')
+               'spike, circle), ZYNNM_BF_EXTRA, rOpt(127,use-as-base waveform),')
+          sub1(O, '#define rObject OscilGen\n', '#define rObject OscilGen\n// rOptions takes 16 names at most and rOption 12 arguments, so the new names are one macro\n#define ZYNNM_BF_EXTRA rOpt(16,organ) rOpt(17,softsqr) rOpt(18,formant) rOpt(19,hardsync) \\\n    rOpt(20,bell) rOpt(21,steps) rOpt(22,fold) rOpt(23,sinesaw)\n')
 
+          # (rOptions takes at most 16 names, the new ones are added with rOpt)
           # the menu: new entries go before the hidden "User" entry (the editor finds User as size()-2)
           F = 'src/UI/OscilGenUI.fl'
           items = ''
