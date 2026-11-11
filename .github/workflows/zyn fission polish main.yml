@@ -2868,6 +2868,519 @@ jobs:
           print('stage 15 patches applied')
           PYEOF
 
+      - name: "Stage 16 (wavetables - Table base waveform and the list next to the oscillator editor)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          mkdir -p /tmp/zynnm_files
+          cat > /tmp/zynnm_files/zyn_paths.h <<'HEOF'
+          #pragma once
+          // ZYNNM XT: where the user's files live
+          //   Windows: %USERPROFILE%\ZYNNM XT\...      other systems: $HOME/ZYNNM XT/...
+          #include <string>
+          #include <stdlib.h>
+          #include <sys/stat.h>
+          #ifdef _WIN32
+          #include <direct.h>
+          #endif
+
+          static inline void zynnm_mkdir(const std::string &p)
+          {
+          #ifdef _WIN32
+              _mkdir(p.c_str());
+          #else
+              mkdir(p.c_str(), 0755);
+          #endif
+          }
+
+          // ...\ZYNNM XT\Wavetables   (the environment variable ZYNNM_WAVETABLES can point somewhere else)
+          static inline std::string zynnm_wavetable_dir()
+          {
+              static std::string dir;
+              if(!dir.empty())
+                  return dir;
+              const char *env = getenv("ZYNNM_WAVETABLES");
+              if(env && *env) {
+                  dir = env;
+                  zynnm_mkdir(dir);
+                  return dir;
+              }
+          #ifdef _WIN32
+              const char *home = getenv("USERPROFILE");
+              const char  sep  = '\\';
+          #else
+              const char *home = getenv("HOME");
+              const char  sep  = '/';
+          #endif
+              std::string base = home ? home : ".";
+              base += sep;
+              base += "ZYNNM XT";
+              zynnm_mkdir(base);
+              dir = base + sep + "Wavetables";
+              zynnm_mkdir(dir);
+              return dir;
+          }
+
+          // a table is named like "Analog/Acid" (folder/file without .wav): refuse anything that could leave the folder
+          static inline bool zynnm_safe_name(const std::string &n)
+          {
+              if(n.empty() || n.size() > 90)
+                  return false;
+              if(n[0] == '/' || n[0] == '\\' || n.find("..") != std::string::npos
+                 || n.find(':') != std::string::npos || n.find('\\') != std::string::npos)
+                  return false;
+              return true;
+          }
+          HEOF
+          cat > /tmp/zynnm_files/WavetablePanel.h <<'HEOF'
+          #pragma once
+          // ZYNNM XT: list of wavetables (Serum .wav files) next to the oscillator editor.
+          // Click a table: it becomes the "Table" base waveform of this oscillator (the Par knob moves through its frames).
+          #include <FL/Fl.H>
+          #include <FL/Fl_Group.H>
+          #include <FL/Fl_Box.H>
+          #include <FL/Fl_Button.H>
+          #include <FL/Fl_Hold_Browser.H>
+          #include <FL/fl_draw.H>
+          #include <dirent.h>
+          #include <sys/stat.h>
+          #include <string>
+          #include <vector>
+          #include <algorithm>
+          #include <ctype.h>
+          #include <string.h>
+          #include <stdio.h>
+          #include "Fl_Osc_Interface.h"
+          #include "../zyn_paths.h"
+
+          class WavetablePanel : public Fl_Group
+          {
+          public:
+              WavetablePanel(int X, int Y, int W, int H, Fl_Osc_Interface *osc_, const std::string &loc_)
+                  : Fl_Group(X, Y, W, H), osc(osc_), loc(loc_)
+              {
+                  box(FL_FLAT_BOX);
+                  color(fl_rgb_color(26, 34, 44));
+                  title = new Fl_Box(X + 6, Y + 6, W - 12, 22, "WAVETABLES");
+                  title->box(FL_NO_BOX);
+                  title->labelfont(FL_HELVETICA_BOLD);
+                  title->labelsize(14);
+                  title->labelcolor(fl_rgb_color(215, 240, 230));
+                  title->align(FL_ALIGN_INSIDE | FL_ALIGN_LEFT);
+
+                  list = new Fl_Hold_Browser(X + 6, Y + 32, W - 12, H - 32 - 100);
+                  list->textsize(12);
+                  list->color(fl_rgb_color(16, 22, 30));
+                  list->textcolor(fl_rgb_color(215, 240, 230));
+                  list->selection_color(fl_rgb_color(0, 128, 76));
+                  list->callback(list_cb, this);
+
+                  refreshbtn = new Fl_Button(X + 6, Y + H - 62, W - 12, 28, "Refresh list");
+                  refreshbtn->box(FL_FLAT_BOX);
+                  refreshbtn->down_box(FL_FLAT_BOX);
+                  refreshbtn->color(fl_rgb_color(22, 30, 40));
+                  refreshbtn->selection_color(fl_rgb_color(0, 128, 76));
+                  refreshbtn->labelcolor(fl_rgb_color(215, 240, 230));
+                  refreshbtn->labelfont(FL_HELVETICA_BOLD);
+                  refreshbtn->clear_visible_focus();
+                  refreshbtn->callback(refresh_cb, this);
+
+                  info = new Fl_Box(X + 6, Y + H - 96, W - 12, 32, "");
+                  info->box(FL_NO_BOX);
+                  info->labelsize(11);
+                  info->labelcolor(fl_rgb_color(143, 167, 176));
+                  info->align(FL_ALIGN_INSIDE | FL_ALIGN_LEFT | FL_ALIGN_WRAP);
+                  end();
+                  scan();
+              }
+
+              // read the folder: Name.wav and Folder/Name.wav (one level of sub-folders)
+              void scan()
+              {
+                  names.clear();
+                  list->clear();
+                  const std::string root = zynnm_wavetable_dir();
+                  add_dir(root, "");
+                  DIR *d = opendir(root.c_str());
+                  if(d) {
+                      struct dirent *e;
+                      std::vector<std::string> subs;
+                      while((e = readdir(d))) {
+                          const std::string n = e->d_name;
+                          if(n == "." || n == "..")
+                              continue;
+                          struct stat st;
+                          if(stat((root + "/" + n).c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+                              subs.push_back(n);
+                      }
+                      closedir(d);
+                      std::sort(subs.begin(), subs.end(), less_nocase);
+                      for(size_t i = 0; i < subs.size(); ++i)
+                          add_dir(root + "/" + subs[i], subs[i] + "/");
+                  }
+                  for(size_t i = 0; i < names.size(); ++i)
+                      list->add(("@." + names[i]).c_str());   // "@." = show the text as it is
+                  char msg[400];
+                  if(names.empty())
+                      snprintf(msg, sizeof(msg), "No tables found.\nCopy Serum .wav tables into:\n%s", root.c_str());
+                  else
+                      snprintf(msg, sizeof(msg), "%d tables. Click one, then move the Par dial to scan its frames.",
+                               (int)names.size());
+                  info->copy_label(msg);
+                  redraw();
+              }
+
+          private:
+              static bool less_nocase(const std::string &a, const std::string &b)
+              {
+                  const size_t n = a.size() < b.size() ? a.size() : b.size();
+                  for(size_t i = 0; i < n; ++i) {
+                      const int x = tolower((unsigned char)a[i]), y = tolower((unsigned char)b[i]);
+                      if(x != y)
+                          return x < y;
+                  }
+                  return a.size() < b.size();
+              }
+
+              // add the .wav files of one folder; prefix is "" or "Folder/"
+              void add_dir(const std::string &dir, const std::string &prefix)
+              {
+                  DIR *d = opendir(dir.c_str());
+                  if(!d)
+                      return;
+                  std::vector<std::string> found;
+                  struct dirent *e;
+                  while((e = readdir(d))) {
+                      const std::string n = e->d_name;
+                      if(n.size() > 4 && !strcasecmp_tail(n, ".wav"))
+                          found.push_back(n.substr(0, n.size() - 4));
+                  }
+                  closedir(d);
+                  std::sort(found.begin(), found.end(), less_nocase);
+                  for(size_t i = 0; i < found.size(); ++i)
+                      names.push_back(prefix + found[i]);
+              }
+
+              static bool strcasecmp_tail(const std::string &n, const char *tail)
+              {
+                  const size_t t = strlen(tail);
+                  for(size_t i = 0; i < t; ++i)
+                      if(tolower((unsigned char)n[n.size() - t + i]) != tolower((unsigned char)tail[i]))
+                          return true;     // differs
+                  return false;            // same
+              }
+
+              void picked()
+              {
+                  const int v = list->value();
+                  if(v < 1 || v > (int)names.size() || !osc)
+                      return;
+                  osc->write(loc + "wavetable", "s", names[v - 1].c_str());
+                  do_callback();           // the oscillator editor refreshes its display
+              }
+
+              static void list_cb(Fl_Widget *, void *d) { ((WavetablePanel *)d)->picked(); }
+              static void refresh_cb(Fl_Widget *, void *d) { ((WavetablePanel *)d)->scan(); }
+
+              Fl_Osc_Interface    *osc;
+              std::string          loc;
+              std::vector<std::string> names;
+              Fl_Box              *title;
+              Fl_Box              *info;
+              Fl_Hold_Browser     *list;
+              Fl_Button           *refreshbtn;
+          };
+          HEOF
+          python3 - <<'PYEOF'
+          import shutil
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # new files
+          shutil.copy('/tmp/zynnm_files/zyn_paths.h', 'src/zyn_paths.h')
+          shutil.copy('/tmp/zynnm_files/WavetablePanel.h', 'src/UI/WavetablePanel.h')
+
+          # ---- OscilGen.h ----
+          H = 'src/Synth/OscilGen.h'
+          sub1(H, 'namespace zyn {\n\nclass OscilGen:public Presets\n', 'namespace zyn {\n\nstruct ZynWaveTable;   // ZYNNM XT wavetable (frames of a Serum .wav file)\n\nclass OscilGen:public Presets\n')
+          sub1(H, '        unsigned char Pbasefuncpar; //the parameter of the base function\n',
+               '''        unsigned char Pbasefuncpar; //the parameter of the base function
+
+                  // ZYNNM XT: base function 24 "Table" plays a wavetable, Pbasefuncpar is the position in it
+                  char Pwavetable[96];             // file name without .wav, like "Analog/Acid"
+                  const ZynWaveTable *wt;          // loaded table (never freed, so the audio thread may read it)
+                  bool setwavetable(const char *name);   // false when the file cannot be read
+          ''')
+
+          # ---- OscilGen.cpp ----
+          O = 'src/Synth/OscilGen.cpp'
+          sub1(O, '#include "../Misc/WaveShapeSmps.h"\n', '#include "../Misc/WaveShapeSmps.h"\n#include "../zyn_paths.h"\n#include <map>\n#include <vector>\n#include <string>\n#include <string.h>\n')
+          sub1(O, '#define ZYNNM_BF_EXTRA rOpt(16,organ) rOpt(17,softsqr) rOpt(18,formant) rOpt(19,hardsync) \\\n    rOpt(20,bell) rOpt(21,steps) rOpt(22,fold) rOpt(23,sinesaw)\n',
+               '#define ZYNNM_BF_EXTRA rOpt(16,organ) rOpt(17,softsqr) rOpt(18,formant) rOpt(19,hardsync) \\\n    rOpt(20,bell) rOpt(21,steps) rOpt(22,fold) rOpt(23,sinesaw) rOpt(24,table)\n')
+          # the port that chooses the table
+          sub1(O, '    {"use-as-base:", rProp(non-realtime)',
+               '''    {"wavetable::s", rProp(non-realtime) rDoc("Wavetable file for the Table base waveform"),
+                  NULL, [](const char *msg, rtosc::RtData &d) {
+                      OscilGen *o = (OscilGen*)d.obj;
+                      if(rtosc_narguments(msg)) {
+                          if(o->setwavetable(rtosc_argument(msg, 0).s)) {
+                              o->Pcurrentbasefunc = 24;   // choosing a table selects the Table base waveform
+                              o->Pbasefuncpar     = 0;    // starting at its first frame
+                          }
+                          //XXX hack hack (same as use-as-base)
+                          char  repath[128];
+                          strcpy(repath, d.loc);
+                          char *edit   = strrchr(repath, '/')+1;
+                          *edit = 0;
+                          d.reply("/damage", "s", repath);
+                      } else
+                          d.reply(d.loc, "s", o->Pwavetable);
+                  }},
+              {"use-as-base:", rProp(non-realtime)''')
+
+          # the wavetable loader and reader, before the constructor
+          sub1(O, 'OscilGen::OscilGen(const SYNTH_T &synth_, FFTwrapper *fft_, Resonance *res_)\n',
+               r'''// ---- ZYNNM XT wavetables --------------------------------------------------------------------------
+          // A table is a .wav file (Serum style: frames of 2048 samples one after the other, 16/24/32 bit or float).
+          // Loaded tables stay in memory for good, so the audio thread can read them without any lock.
+          #define ZYNNM_TABLE_FUNC 24
+
+          struct ZynWaveTable
+          {
+              std::vector<float> data;    // frames * framesize samples
+              int                framesize;
+              int                frames;
+          };
+
+          static unsigned zynRd32(const unsigned char *p)
+          {
+              return (unsigned)p[0] | ((unsigned)p[1] << 8) | ((unsigned)p[2] << 16) | ((unsigned)p[3] << 24);
+          }
+
+          static unsigned zynRd16(const unsigned char *p)
+          {
+              return (unsigned)p[0] | ((unsigned)p[1] << 8);
+          }
+
+          static std::map<std::string, ZynWaveTable *> &zynWtCache()
+          {
+              static std::map<std::string, ZynWaveTable *> cache;
+              return cache;
+          }
+
+          static ZynWaveTable *zynLoadWaveTable(const std::string &name)
+          {
+              static size_t total = 0;
+              if(!zynnm_safe_name(name))
+                  return NULL;
+              std::map<std::string, ZynWaveTable *> &cache = zynWtCache();
+              std::map<std::string, ZynWaveTable *>::iterator it = cache.find(name);
+              if(it != cache.end())
+                  return it->second;
+
+              const std::string path = zynnm_wavetable_dir() + "/" + name + ".wav";
+              FILE *f = fopen(path.c_str(), "rb");
+              if(!f)
+                  return NULL;
+              fseek(f, 0, SEEK_END);
+              const long len = ftell(f);
+              fseek(f, 0, SEEK_SET);
+              if(len < 44 || len > 48 * 1024 * 1024) {
+                  fclose(f);
+                  return NULL;
+              }
+              std::vector<unsigned char> buf((size_t)len);
+              const size_t got = fread(&buf[0], 1, (size_t)len, f);
+              fclose(f);
+              if(got != (size_t)len || memcmp(&buf[0], "RIFF", 4) || memcmp(&buf[8], "WAVE", 4))
+                  return NULL;
+
+              int    fmt = 0, chans = 1, bits = 16, clmsize = 0;
+              size_t dataoff = 0, datalen = 0;
+              size_t p = 12;
+              while(p + 8 <= (size_t)len) {
+                  size_t sz = zynRd32(&buf[p + 4]);
+                  const size_t avail = (size_t)len - (p + 8);
+                  if(sz > avail)
+                      sz = avail;     // cut-off file
+                  const unsigned char *c = &buf[p + 8];
+                  if(!memcmp(&buf[p], "fmt ", 4) && sz >= 16) {
+                      fmt   = (int)zynRd16(c);
+                      chans = (int)zynRd16(c + 2);
+                      bits  = (int)zynRd16(c + 14);
+                      if(fmt == 0xFFFE && sz >= 26)
+                          fmt = (int)zynRd16(c + 24);     // extensible: the real format comes from the sub-format
+                  } else if(!memcmp(&buf[p], "clm ", 4) && sz >= 4 && !memcmp(c, "<!>", 3)) {
+                      char num[12];
+                      size_t k = 0;
+                      while(k < 10 && 3 + k < sz && c[3 + k] >= '0' && c[3 + k] <= '9') {
+                          num[k] = (char)c[3 + k];
+                          ++k;
+                      }
+                      num[k]  = 0;
+                      clmsize = atoi(num);        // Serum tells the frame size here
+                  } else if(!memcmp(&buf[p], "data", 4)) {
+                      dataoff = p + 8;
+                      datalen = sz;
+                  }
+                  p += 8 + sz + (sz & 1);
+              }
+              if(!dataoff || chans < 1 || bits < 8 || (bits & 7))
+                  return NULL;
+              const bool isfloat = (fmt == 3);
+              if(!(fmt == 1 || isfloat) || (isfloat && bits != 32 && bits != 64))
+                  return NULL;
+              const size_t bps   = (size_t)bits / 8;
+              const size_t block = bps * (size_t)chans;
+              const size_t count = datalen / block;
+              if(count < 8)
+                  return NULL;
+
+              std::vector<float> mono(count);
+              for(size_t i = 0; i < count; ++i) {
+                  const unsigned char *s = &buf[dataoff + i * block];   // first channel only
+                  float v = 0.0f;
+                  if(isfloat) {
+                      if(bits == 32) {
+                          float x;
+                          memcpy(&x, s, 4);
+                          v = x;
+                      } else {
+                          double x;
+                          memcpy(&x, s, 8);
+                          v = (float)x;
+                      }
+                  } else if(bits == 8)
+                      v = ((int)s[0] - 128) / 128.0f;
+                  else if(bits == 16)
+                      v = (short)zynRd16(s) / 32768.0f;
+                  else if(bits == 24)
+                      v = (int)((zynRd32(s) << 8) & 0xFFFFFF00u) / 2147483648.0f;
+                  else if(bits == 32)
+                      v = (int)zynRd32(s) / 2147483648.0f;
+                  else
+                      return NULL;
+                  if(!(v == v))
+                      v = 0.0f;       // NaN
+                  mono[i] = v;
+              }
+
+              int framesize = (clmsize >= 32 && clmsize <= 65536) ? clmsize : 2048;
+              if((size_t)framesize > count)
+                  framesize = (int)count;
+              const int frames = (int)(count / (size_t)framesize);
+              if(frames < 1 || total + (size_t)frames * (size_t)framesize * 4 > 256u * 1024u * 1024u)
+                  return NULL;
+
+              ZynWaveTable *t = new ZynWaveTable;
+              t->framesize = framesize;
+              t->frames    = frames;
+              t->data.assign(mono.begin(), mono.begin() + (size_t)frames * (size_t)framesize);
+              total += (size_t)frames * (size_t)framesize * 4;
+              cache[name] = t;
+              return t;
+          }
+
+          // one sample of the table: x = position in the cycle (0..1), pos = position in the table (0..1)
+          static float zynWtSample(const ZynWaveTable *t, float x, float pos, int oscilsize)
+          {
+              const int   fs   = t->framesize;
+              const float fpos = pos * (float)(t->frames - 1);
+              int f0 = (int)fpos;
+              if(f0 > t->frames - 1)
+                  f0 = t->frames - 1;
+              const int   f1 = (f0 + 1 < t->frames) ? f0 + 1 : f0;
+              const float fr = fpos - (float)f0;
+              const float *a = &t->data[(size_t)f0 * (size_t)fs];
+              const float *b = &t->data[(size_t)f1 * (size_t)fs];
+
+              const float idx = x * (float)fs;
+              const int   i0  = (int)idx;
+              int box = fs / oscilsize;       // frame has more samples than the oscillator: average them
+              if(box < 1)
+                  box = 1;
+              float va = 0.0f, vb = 0.0f;
+              if(box == 1) {
+                  const float k  = idx - (float)i0;
+                  const int   ia = i0 % fs, ib = (i0 + 1) % fs;
+                  va = a[ia] + (a[ib] - a[ia]) * k;
+                  vb = b[ia] + (b[ib] - b[ia]) * k;
+              } else {
+                  const int start = i0 - box / 2;
+                  for(int j = 0; j < box; ++j) {
+                      const int ii = ((start + j) % fs + fs) % fs;
+                      va += a[ii];
+                      vb += b[ii];
+                  }
+                  va /= (float)box;
+                  vb /= (float)box;
+              }
+              return va + (vb - va) * fr;
+          }
+
+          bool OscilGen::setwavetable(const char *name)
+          {
+              char tmp[sizeof(Pwavetable)];
+              tmp[0] = 0;
+              if(name) {
+                  strncpy(tmp, name, sizeof(tmp) - 1);
+                  tmp[sizeof(tmp) - 1] = 0;
+              }
+              memcpy(Pwavetable, tmp, sizeof(Pwavetable));
+              wt = tmp[0] ? zynLoadWaveTable(tmp) : NULL;
+              oldbasefunc     = 255;       // makes prepare() build the base function again
+              cachedbasevalid = false;
+              return wt != NULL;
+          }
+
+          OscilGen::OscilGen(const SYNTH_T &synth_, FFTwrapper *fft_, Resonance *res_)
+          ''')
+          # defaults
+          sub1(O, '    Pcurrentbasefunc = 0;\n    Pbasefuncpar     = 64;\n', '    Pcurrentbasefunc = 0;\n    Pbasefuncpar     = 64;\n    Pwavetable[0]    = 0;\n    wt               = NULL;\n')
+          # evaluation
+          sub1(O, '    base_func func = getBaseFunction(Pcurrentbasefunc);\n',
+               '    base_func func = (Pcurrentbasefunc == ZYNNM_TABLE_FUNC) ? NULL : getBaseFunction(Pcurrentbasefunc);\n    const float tablepos = Pbasefuncpar / 127.0f;\n')
+          sub1(O, '        if(func)\n            smps[i] = func(t, par);\n        else if (Pcurrentbasefunc == 0)',
+               '        if(Pcurrentbasefunc == ZYNNM_TABLE_FUNC)\n            smps[i] = wt ? zynWtSample(wt, t, tablepos, synth.oscilsize)\n                         : -sinf(2.0f * PI * i / synth.oscilsize);   // no table loaded: sine\n        else if(func)\n            smps[i] = func(t, par);\n        else if (Pcurrentbasefunc == 0)')
+          # copy / paste
+          sub1(O, '    COPY(Pcurrentbasefunc);\n    COPY(Pbasefuncpar);\n', '    COPY(Pcurrentbasefunc);\n    COPY(Pbasefuncpar);\n    memcpy(this->Pwavetable, o.Pwavetable, sizeof(Pwavetable));\n    this->wt = o.wt;\n')
+          # xml
+          sub1(O, '    xml.addpar("base_function_par", Pbasefuncpar);\n', '    xml.addpar("base_function_par", Pbasefuncpar);\n    if(Pwavetable[0])\n        xml.addparstr("wavetable", Pwavetable);\n')
+          sub1(O, '    Pbasefuncpar     = xml.getpar127("base_function_par", Pbasefuncpar);\n',
+               '    Pbasefuncpar     = xml.getpar127("base_function_par", Pbasefuncpar);\n    setwavetable(xml.getparstr("wavetable", "").c_str());\n')
+
+          # ---- editor: menu entry, panel ----
+          F = 'src/UI/OscilGenUI.fl'
+          sub1(F, '\t    MenuItem {} {\n\t      label User',
+               '            MenuItem {} {\n              label Table\n              xywh {127 127 100 20} labelfont 1 labelsize 11\n            }\n\t    MenuItem {} {\n\t      label User')
+          sub1(F, 'decl {\\#include "UnifiedShell.h"} {public local\n}\n',
+               'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "WavetablePanel.h"} {public local\n}\n')
+          sub1(F, 'make_window();\nbftype->init("Pcurrentbasefunc");\ninitialized = true;\n',
+               '''make_window();
+          bftype->init("Pcurrentbasefunc");
+          if(Fl::w() >= 1350) {   // big screen: the wavetable list sits to the right of the editor
+              osceditUI->size(1042, 595);
+              osceditUI->begin();
+              WavetablePanel *wtp = new WavetablePanel(740, 0, 300, 595, osc, loc);
+              osceditUI->end();
+              wtp->callback([](Fl_Widget *, void *d) {
+                  OscilEditor *e = (OscilEditor *)d;
+                  e->bftype->update();
+                  e->bfpar->update();
+                  e->refresh();
+              }, this);
+          }
+          initialized = true;
+          ''')
+          print('stage 16 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
