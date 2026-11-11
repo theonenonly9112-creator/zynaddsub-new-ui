@@ -2795,6 +2795,79 @@ jobs:
           print('stage 13 patches applied')
           PYEOF
 
+      - name: "Stage 15 (instrument info / author notes inside the GLOBAL tab)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          H = 'src/UI/UnifiedShell.h'
+          sub1(H, 'void zyn_embed_global(Fl_Window *w, int slot);\n',
+               'void zyn_embed_global(Fl_Window *w, int slot);\n'
+               '// instrument info (type, author and copyright, comments) -> GLOBAL tab\n'
+               'void zyn_embed_info(Fl_Window *w);\n')
+
+          U = 'src/UI/UnifiedShell.cpp'
+          sub1(U, 'int        g_ctl_x = 0, g_ctl_y = 0, g_fxp_x = 0, g_fxp_y = 0;\n',
+               'int        g_ctl_x = 0, g_ctl_y = 0, g_fxp_x = 0, g_fxp_y = 0;\n'
+               'int        g_info_x = 0, g_info_y = 0;   // instrument info (author notes) in GLOBAL\n'
+               'bool       g_info_ok = false;\n')
+          sub1(U, '// the part\'s three insert effects live in FX\nvoid zyn_embed_fx(Fl_Window *w)',
+               '''// Instrument info (type, author and copyright, comments) lives permanently in GLOBAL.
+          // The engine switches, Kit Edit, Effects and Close of the old window are not shown there.
+          void zyn_embed_info(Fl_Window *w)
+          {
+              if(!w)
+                  return;
+              if(!g_global || !g_info_ok) {   // small screen: the old window, as before
+                  w->show();
+                  return;
+              }
+              if(w->parent() != g_global) {
+                  for(int i = 0; i < w->children(); ++i) {
+                      Fl_Widget *c = w->child(i);
+                      if(c->y() >= 215)       // engine switches / Kit Edit / Effects (y 220) and Close (y 335)
+                          c->hide();
+                  }
+                  w->size(395, 215);
+              }
+              embed_into(g_global, w, g_info_x, g_info_y);
+              show_page(3);
+          }
+
+          // the part's three insert effects live in FX
+          void zyn_embed_fx(Fl_Window *w)''')
+          sub1(U, '    if(g_ui && g_ui->partui && g_ui->partui->instrumenteditwindow)\n        g_ui->partui->instrumenteditwindow->show();\n',
+               '    if(g_ui && g_ui->partui && g_ui->partui->instrumenteditwindow)\n        zyn_embed_info(g_ui->partui->instrumenteditwindow);\n')
+          sub1(U, '            pb->callback(preset_cb, (void *)(intptr_t)i);\n        }\n        g_pages[3]->end();\n',
+               '''            pb->callback(preset_cb, (void *)(intptr_t)i);
+                  }
+                  g_pages[3]->end();
+                  if(big) {   // the author notes go under the preset buttons
+                      g_info_x = nx;
+                      g_info_y = by + 26 + 44 + PAD;
+                      g_info_ok = true;
+                  }
+          ''')
+          sub1(U, '        if(ui->partui->ctlwindow)\n            zyn_embed_global(ui->partui->ctlwindow, 0);\n',
+               '        if(ui->partui->ctlwindow)\n            zyn_embed_global(ui->partui->ctlwindow, 0);\n'
+               '        if(ui->partui->instrumenteditwindow)\n            zyn_embed_info(ui->partui->instrumenteditwindow);\n')
+
+          # every place that opened the old Instrument Edit window now goes to GLOBAL
+          sub1('src/UI/PartUI.fl', '       else instrumenteditwindow->show();\n', '       else zyn_embed_info(instrumenteditwindow);\n')
+          sub1('src/UI/PartUI.fl', 'callback {instrumenteditwindow->show();}', 'callback {zyn_embed_info(instrumenteditwindow);}')
+          sub1('src/UI/MasterUI.fl', '        partui->instrumenteditwindow->show();\n', '        zyn_embed_info(partui->instrumenteditwindow);\n')
+          print('stage 15 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
@@ -2963,6 +3036,8 @@ jobs:
           else
             echo "WARNING: the single-file plugin was not built, out/vst holds the dynamic plugin (needs its DLLs)"
           fi
+          # zlib next to the plugin, in case it is still imported (this fixed FL Studio)
+          [ -f /mingw32/bin/libz-1.dll ] && cp -n /mingw32/bin/libz-1.dll out/vst/
           cd out && zip -r ../ZYNNM-XT-win32.zip .
       - uses: actions/upload-artifact@v4
         if: always()
