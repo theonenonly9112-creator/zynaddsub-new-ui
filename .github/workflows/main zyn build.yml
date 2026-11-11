@@ -2782,8 +2782,10 @@ jobs:
                   basefunc_sinesaw,
               };''')
           sub1(O, 'spike, circle), rOpt(127,use-as-base waveform),',
-               'spike, circle, organ, softsqr, formant, hardsync, bell, steps, fold, sinesaw), rOpt(127,use-as-base waveform),')
+               'spike, circle), ZYNNM_BF_EXTRA, rOpt(127,use-as-base waveform),')
+          sub1(O, '#define rObject OscilGen\n', '#define rObject OscilGen\n// rOptions takes 16 names at most and rOption 12 arguments, so the new names are one macro\n#define ZYNNM_BF_EXTRA rOpt(16,organ) rOpt(17,softsqr) rOpt(18,formant) rOpt(19,hardsync) \\\n    rOpt(20,bell) rOpt(21,steps) rOpt(22,fold) rOpt(23,sinesaw)\n')
 
+          # (rOptions takes at most 16 names, the new ones are added with rOpt)
           # the menu: new entries go before the hidden "User" entry (the editor finds User as size()-2)
           F = 'src/UI/OscilGenUI.fl'
           items = ''
@@ -2829,29 +2831,42 @@ jobs:
           tail -n 15 ../../build-vst.log
           echo "ninja exit code: $STATUS"
           exit $STATUS
-      - name: Single-file plugin for LMMS (static link, optional)
-        continue-on-error: true
+      - name: Single-file plugin for LMMS and FL (static link, optional)
         run: |
-          cd zynaddsubfx-3.0.3/build
+          cd zynaddsubfx-3.0.3
           set +e
-          mkdir -p ../../stash
-          DYN=$(find . -name ZynAddSubFX.dll | head -n 1)
-          if [ -z "$DYN" ]; then echo "no plugin dll, skipping"; exit 0; fi
-          cp "$DYN" ../../stash/ZynAddSubFX-dynamic.dll
-          cmake . -DCMAKE_SHARED_LINKER_FLAGS="-static -static-libgcc -static-libstdc++" \
-            -DCMAKE_CXX_STANDARD_LIBRARIES="-lws2_32 -liphlpapi -lwinmm" > ../../cmake-static.log 2>&1
+          mkdir -p ../stash
+          # The first static try still needed libz-1.dll: CMake picks the import library (libz.dll.a) before the
+          # static one (libz.a). So hide every import library that has a static twin, and configure a fresh
+          # build folder so that the library paths are found again.
+          for f in /mingw32/lib/lib*.dll.a; do
+            [ -f "$f" ] || continue
+            if [ -f "${f%.dll.a}.a" ]; then mv "$f" "$f.off"; echo "hidden: $f"; fi
+          done
+          mkdir build-static && cd build-static
+          cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_CXX_FLAGS="-include cstdint -g -fno-omit-frame-pointer -mstackrealign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601" \
+            -DCMAKE_C_FLAGS="-g -fno-omit-frame-pointer -mstackrealign -D_WIN32_WINNT=0x0601 -DWINVER=0x0601" \
+            -DCMAKE_SHARED_LINKER_FLAGS="-static -static-libgcc -static-libstdc++" \
+            -DCMAKE_CXX_STANDARD_LIBRARIES="-lws2_32 -liphlpapi -lwinmm -lole32 -luuid -lsetupapi" \
+            -DGuiModule=fltk -DPaEnable=ON \
+            -DJackEnable=OFF -DAlsaEnable=OFF -DOssEnable=OFF > ../../cmake-static.log 2>&1
           ninja ZynAddSubFX_vst > ../../build-static.log 2>&1
           STATUS=$?
+          # give the import libraries back
+          for f in /mingw32/lib/lib*.dll.a.off; do [ -f "$f" ] && mv "$f" "${f%.off}"; done
           echo "================ STATIC PLUGIN: LAST 15 LINES ================"
           tail -n 15 ../../build-static.log
           grep -n -E "error:|undefined reference|cannot find" ../../build-static.log | head -20
-          if [ $STATUS -eq 0 ]; then
-            cp "$DYN" ../../stash/ZynAddSubFX-static.dll
+          SDLL=$(find . -name ZynAddSubFX.dll | head -n 1)
+          if [ $STATUS -eq 0 ] && [ -n "$SDLL" ]; then
+            cp "$SDLL" ../../stash/ZynAddSubFX-static.dll
             echo "===== files the single-file plugin still needs ====="
             objdump -p ../../stash/ZynAddSubFX-static.dll | grep "DLL Name"
           fi
-          cp ../../stash/ZynAddSubFX-dynamic.dll "$DYN"
           exit 0
+
       - name: Collect files
         run: |
           mkdir -p out
@@ -2903,6 +2918,17 @@ jobs:
           echo "===== FILES IN ZIP ====="
           ls -R out | head -n 60
           # every exe and dll in every folder must find its DLLs next to it (the single-file plugin was never checked)
+          echo "===== dependency table (every DLL each file imports) ====="
+          for f in out/*.exe out/vst/*.exe out/vst/*.dll out/vst-lmms/*.exe out/vst-lmms/*.dll; do
+            [ -f "$f" ] || continue
+            echo "-- $f"
+            for dll in $(objdump -p "$f" | grep "DLL Name" | awk '{print $3}'); do
+              if [ -f "$(dirname "$f")/$dll" ]; then st="next to it";
+              elif [ -f "/mingw32/bin/$dll" ]; then st="IN MINGW BIN BUT NOT COPIED";
+              else st="system or NOT FOUND"; fi
+              echo "   $dll : $st"
+            done
+          done
           echo "===== dependency check ====="
           for f in out/*.exe out/vst/*.exe out/vst/*.dll out/vst-lmms/*.exe out/vst-lmms/*.dll; do
             [ -f "$f" ] || continue
