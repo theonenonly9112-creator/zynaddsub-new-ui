@@ -3381,6 +3381,203 @@ jobs:
           print('stage 16 patches applied')
           PYEOF
 
+      - name: "Stage 17 (author notes are sent to the synth with every edit)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          U = 'src/UI/UnifiedShell.cpp'
+          # the text boxes send their text only when they lose focus, and clicking a button or switching the tab never takes
+          # the focus away: the author notes were never sent to the synth. Send them with every change instead.
+          sub1(U, '        w->size(395, 215);\n    }\n    embed_into(g_global, w, g_info_x, g_info_y);\n',
+               '''        w->size(395, 215);
+                  for(int i = 0; i < w->children(); ++i) {
+                      Fl_Group *g = w->child(i)->as_group();
+                      if(!g)
+                          continue;
+                      for(int k = 0; k < g->children(); ++k)
+                          if(Fl_Input *in = dynamic_cast<Fl_Input *>(g->child(k)))
+                              in->when(FL_WHEN_CHANGED | FL_WHEN_RELEASE);   // author and comments: send every edit
+                  }
+              }
+              embed_into(g_global, w, g_info_x, g_info_y);
+          ''')
+          s = rd(U)
+          if '#include <FL/Fl_Input.H>' not in s:
+              i = s.index('#include')
+              wr(U, s[:i] + '#include <FL/Fl_Input.H>\n' + s[i:])
+          print('stage 17 patches applied')
+          PYEOF
+
+      - name: "Stage 18 (Wavetables and Waveforms folders are made next to the synth)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          mkdir -p /tmp/zynnm_files
+          cat > /tmp/zynnm_files/zyn_paths_new.h <<'HEOF'
+          #pragma once
+          // ZYNNM XT: where the user's files live.
+          // Order for every folder (Wavetables, Waveforms):
+          //   1. the environment variable (ZYNNM_WAVETABLES / ZYNNM_WAVEFORMS) holding the full folder name
+          //   2. a folder with that name next to the plugin (or program), made automatically: ZYNNM_HOME\Wavetables
+          //   3. %USERPROFILE%\ZYNNM XT\Wavetables   (other systems: $HOME/ZYNNM XT/...)
+          #include <string>
+          #include <stdlib.h>
+          #include <sys/stat.h>
+          #ifdef _WIN32
+          #include <direct.h>
+          #endif
+
+          static inline void zynnm_mkdir(const std::string &p)
+          {
+          #ifdef _WIN32
+              _mkdir(p.c_str());
+          #else
+              mkdir(p.c_str(), 0755);
+          #endif
+          }
+
+          static inline bool zynnm_dir_exists(const std::string &p)
+          {
+              struct stat st;
+              return stat(p.c_str(), &st) == 0 && (st.st_mode & S_IFDIR);
+          }
+
+          // remember the folder of the plugin / program (path = full name of its file), unless it is known already
+          static inline void zynnm_set_home_from_path(const char *path)
+          {
+              if(!path || (getenv("ZYNNM_HOME") && *getenv("ZYNNM_HOME")))
+                  return;
+              const std::string s(path);
+              const size_t k = s.find_last_of("\\/");
+              if(k == std::string::npos)
+                  return;
+              const std::string e = "ZYNNM_HOME=" + s.substr(0, k);
+          #ifdef _WIN32
+              _putenv(e.c_str());
+          #else
+              setenv("ZYNNM_HOME", s.substr(0, k).c_str(), 1);
+          #endif
+          }
+
+          static inline std::string zynnm_pick_dir(const char *envname, const char *leaf)
+          {
+              const char *env = getenv(envname);
+              if(env && *env) {
+                  const std::string d = env;
+                  zynnm_mkdir(d);
+                  return d;
+              }
+          #ifdef _WIN32
+              const char sep = '\\';
+          #else
+              const char sep = '/';
+          #endif
+              const char *zhome = getenv("ZYNNM_HOME");
+              if(zhome && *zhome) {
+                  const std::string d = std::string(zhome) + sep + leaf;
+                  if(!zynnm_dir_exists(d))
+                      zynnm_mkdir(d);          // made automatically, right next to the synth
+                  if(zynnm_dir_exists(d))
+                      return d;                // (when it cannot be made, the user profile is used)
+              }
+          #ifdef _WIN32
+              const char *home = getenv("USERPROFILE");
+          #else
+              const char *home = getenv("HOME");
+          #endif
+              std::string base = home ? home : ".";
+              base += sep;
+              base += "ZYNNM XT";
+              zynnm_mkdir(base);
+              const std::string d = base + sep + leaf;
+              zynnm_mkdir(d);
+              return d;
+          }
+
+          static inline std::string zynnm_wavetable_dir()
+          {
+              static std::string dir;
+              if(dir.empty())
+                  dir = zynnm_pick_dir("ZYNNM_WAVETABLES", "Wavetables");
+              return dir;
+          }
+
+          // a table is named like "Analog/Acid" (folder/file without .wav): refuse anything that could leave the folder
+          static inline bool zynnm_safe_name(const std::string &n)
+          {
+              if(n.empty() || n.size() > 90)
+                  return false;
+              if(n[0] == '/' || n[0] == '\\' || n.find("..") != std::string::npos
+                 || n.find(':') != std::string::npos || n.find('\\') != std::string::npos)
+                  return false;
+              return true;
+          }
+          HEOF
+          python3 - <<'PYEOF'
+          import shutil
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          shutil.copy('/tmp/zynnm_files/zyn_paths_new.h', 'src/zyn_paths.h')
+
+          # waveforms (.zwav) use the same rules
+          P = 'src/Params/PresetsStore.cpp'
+          sub1(P, '#include <sys/stat.h>\n', '#include <sys/stat.h>\n#include "../zyn_paths.h"\n')
+          sub1(P, 'static std::string zwavDir()\n{\n    static std::string dir;\n    if(!dir.empty())\n        return dir;\n',
+               'static std::string zwavDir()\n{\n    static std::string dir;\n    if(!dir.empty())\n        return dir;\n'
+               '    dir = zynnm_pick_dir("ZYNNM_WAVEFORMS", "Waveforms");   // see zyn_paths.h\n    return dir;\n')
+
+          # the plugin tells the engine and the editor where it lives
+          V = 'DPF/distrho/src/DistrhoPluginVST.cpp'
+          sub1(V, '    zyn_plog("VSTPluginMain: called by host");\n',
+               '''    zyn_plog("VSTPluginMain: called by host");
+          #ifdef _WIN32
+              {   // the folder of this plugin: Wavetables / Waveforms folders next to it are used first (another drive)
+                  HMODULE zmod = NULL;
+                  char    zpath[MAX_PATH];
+                  if(GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                        (LPCSTR)&VSTPluginMain, &zmod)
+                     && GetModuleFileNameA(zmod, zpath, MAX_PATH) > 0) {
+                      char *zs = strrchr(zpath, '\\\\');
+                      if(zs) {
+                          *zs = 0;
+                          SetEnvironmentVariableA("ZYNNM_HOME", zpath);
+                          char zenv[MAX_PATH + 16];
+                          snprintf(zenv, sizeof(zenv), "ZYNNM_HOME=%s", zpath);
+                          _putenv(zenv);
+                          zyn_plog("plugin folder: %s", zpath);
+                      }
+                  }
+              }
+          #endif
+          ''')
+
+          # the programs: folder of the exe
+          sub1('src/main.cpp', 'int main(int argc, char *argv[])\n{\n    SYNTH_T synth;\n',
+               'int main(int argc, char *argv[])\n{\n    if(argc > 0)\n        zynnm_set_home_from_path(argv[0]);\n    SYNTH_T synth;\n')
+          sub1('src/UI/guimain.cpp', 'int main(int argc, char *argv[])\n{\n#ifdef WIN32\n    SetUnhandledExceptionFilter(zyn_crash_handler);\n    zyn_open_log("zyn-gui-log.txt");',
+               'int main(int argc, char *argv[])\n{\n    if(argc > 0)\n        zynnm_set_home_from_path(argv[0]);\n#ifdef WIN32\n    SetUnhandledExceptionFilter(zyn_crash_handler);\n    zyn_open_log("zyn-gui-log.txt");')
+          sub1('src/main.cpp', '#include <iostream>\n', '#include <iostream>\n#include "zyn_paths.h"\n')
+          sub1('src/UI/guimain.cpp', '#include <string>\n', '#include <string>\n#include "../zyn_paths.h"\n')
+          print('stage 18 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
