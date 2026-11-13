@@ -3894,6 +3894,44 @@ jobs:
           print('stage 20 patches applied')
           PYEOF
 
+      - name: "Stage 21 (keyboard focus: typing in the author notes and the harmonic name box)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          G = 'src/UI/guimain.cpp'
+          # The editor is a window of another program (the DAW window is its parent), so Windows leaves the keyboard focus
+          # with the DAW and typed letters never reach the text boxes (author notes, harmonic names). Take the keyboard focus
+          # whenever the mouse is pressed in the editor.
+          sub1(G, 'ui_handle_t GUI::createUi(Fl_Osc_Interface *osc, void *exit)\n',
+               '''#ifdef _WIN32
+          static int zyn_focus_handler(int ev)
+          {
+              if(ev == FL_PUSH && zyn_sync_ui && zyn_sync_ui->masterwindow && zyn_sync_ui->masterwindow->shown()) {
+                  HWND h = fl_xid(zyn_sync_ui->masterwindow);
+                  if(h && GetFocus() != h)
+                      SetFocus(h);
+              }
+              return 0;   // the click itself is still handled as usual
+          }
+          #endif
+
+          ui_handle_t GUI::createUi(Fl_Osc_Interface *osc, void *exit)
+          ''')
+          sub1(G, '                Fl::add_timeout(0.0, zyn_sync_root);\n', '                Fl::add_timeout(0.0, zyn_sync_root);\n                Fl::add_handler(zyn_focus_handler);\n')
+          sub1(G, '    Fl::remove_timeout(zyn_sync_root);\n    zyn_sync_ui = 0;\n', '    Fl::remove_timeout(zyn_sync_root);\n    Fl::remove_handler(zyn_focus_handler);\n    zyn_sync_ui = 0;\n')
+          print('stage 21 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
