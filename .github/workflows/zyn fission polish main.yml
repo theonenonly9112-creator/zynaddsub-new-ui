@@ -3578,6 +3578,322 @@ jobs:
           print('stage 18 patches applied')
           PYEOF
 
+      - name: "Stage 19 (saved harmonics list with Save and Delete next to the oscillator editor)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          mkdir -p /tmp/zynnm_files
+          cat > /tmp/zynnm_files/harm_panel.h <<'HEOF'
+
+          // ZYNNM XT: the saved waveforms (.zwav = the whole oscillator: harmonics, base waveform, modulation, filter ...)
+          // Shape the harmonics, type a name, press Save. Click a name to load it, no C and P buttons needed.
+          class HarmonicPanel : public Fl_Group
+          {
+          public:
+              HarmonicPanel(int X, int Y, int W, int H, Fl_Osc_Interface *osc_, const std::string &loc_)
+                  : Fl_Group(X, Y, W, H), osc(osc_), loc(loc_)
+              {
+                  box(FL_FLAT_BOX);
+                  color(fl_rgb_color(26, 34, 44));
+                  title = new Fl_Box(X + 6, Y + 6, W - 12, 22, "SAVED HARMONICS");
+                  title->box(FL_NO_BOX);
+                  title->labelfont(FL_HELVETICA_BOLD);
+                  title->labelsize(14);
+                  title->labelcolor(fl_rgb_color(215, 240, 230));
+                  title->align(FL_ALIGN_INSIDE | FL_ALIGN_LEFT);
+
+                  list = new Fl_Hold_Browser(X + 6, Y + 32, W - 12, H - 136);
+                  list->textsize(12);
+                  list->color(fl_rgb_color(16, 22, 30));
+                  list->textcolor(fl_rgb_color(215, 240, 230));
+                  list->selection_color(fl_rgb_color(0, 128, 76));
+                  list->callback(list_cb, this);
+
+                  info = new Fl_Box(X + 6, Y + H - 100, W - 12, 32, "");
+                  info->box(FL_NO_BOX);
+                  info->labelsize(11);
+                  info->labelcolor(fl_rgb_color(143, 167, 176));
+                  info->align(FL_ALIGN_INSIDE | FL_ALIGN_LEFT | FL_ALIGN_WRAP);
+
+                  namelabel = new Fl_Box(X + 6, Y + H - 64, 46, 26, "Name:");
+                  namelabel->box(FL_NO_BOX);
+                  namelabel->labelsize(12);
+                  namelabel->labelcolor(fl_rgb_color(215, 240, 230));
+                  namelabel->align(FL_ALIGN_INSIDE | FL_ALIGN_LEFT);
+
+                  nameinput = new Fl_Input(X + 54, Y + H - 64, W - 60, 26);
+                  nameinput->textsize(12);
+                  nameinput->color(fl_rgb_color(16, 22, 30));
+                  nameinput->textcolor(fl_rgb_color(215, 240, 230));
+                  nameinput->cursor_color(fl_rgb_color(215, 240, 230));
+
+                  const int bw = (W - 18) / 2;
+                  savebtn = mkbutton(X + 6, Y + H - 34, bw, 28, "Save");
+                  savebtn->callback(save_cb, this);
+                  delbtn = mkbutton(X + 12 + bw, Y + H - 34, bw, 28, "Delete");
+                  delbtn->callback(del_cb, this);
+                  end();
+                  scan();
+              }
+
+              ~HarmonicPanel() { Fl::remove_timeout(timer_cb, this); }
+
+              void scan()
+              {
+                  names.clear();
+                  list->clear();
+                  const std::string dir = zynnm_waveform_dir();
+                  DIR *d = opendir(dir.c_str());
+                  if(d) {
+                      struct dirent *e;
+                      while((e = readdir(d))) {
+                          const std::string n = e->d_name;
+                          if(n.size() > 5 && same_tail(n, ".zwav"))
+                              names.push_back(n.substr(0, n.size() - 5));
+                      }
+                      closedir(d);
+                  }
+                  std::sort(names.begin(), names.end(), less_nocase);
+                  for(size_t i = 0; i < names.size(); ++i)
+                      list->add(("@." + names[i]).c_str());
+                  if(!pending.empty()) {
+                      for(size_t i = 0; i < names.size(); ++i)
+                          if(names[i] == pending)
+                              list->select((int)i + 1);
+                      pending.clear();
+                  }
+                  char msg[400];
+                  if(names.empty())
+                      snprintf(msg, sizeof(msg), "Nothing saved yet. Shape the harmonics, type a name and press Save.");
+                  else
+                      snprintf(msg, sizeof(msg), "%d saved. Click one to load it.\n%s", (int)names.size(), dir.c_str());
+                  info->copy_label(msg);
+                  redraw();
+              }
+
+          private:
+              Fl_Button *mkbutton(int X, int Y, int W, int H, const char *label)
+              {
+                  Fl_Button *b = new Fl_Button(X, Y, W, H, label);
+                  b->box(FL_FLAT_BOX);
+                  b->down_box(FL_FLAT_BOX);
+                  b->color(fl_rgb_color(22, 30, 40));
+                  b->selection_color(fl_rgb_color(0, 128, 76));
+                  b->labelcolor(fl_rgb_color(215, 240, 230));
+                  b->labelfont(FL_HELVETICA_BOLD);
+                  b->clear_visible_focus();
+                  return b;
+              }
+
+              static bool less_nocase(const std::string &a, const std::string &b)
+              {
+                  const size_t n = a.size() < b.size() ? a.size() : b.size();
+                  for(size_t i = 0; i < n; ++i) {
+                      const int x = tolower((unsigned char)a[i]), y = tolower((unsigned char)b[i]);
+                      if(x != y)
+                          return x < y;
+                  }
+                  return a.size() < b.size();
+              }
+
+              static bool same_tail(const std::string &n, const char *tail)
+              {
+                  const size_t t = strlen(tail);
+                  for(size_t i = 0; i < t; ++i)
+                      if(tolower((unsigned char)n[n.size() - t + i]) != tolower((unsigned char)tail[i]))
+                          return false;
+                  return true;
+              }
+
+              void later()   // the synth writes or deletes the file a moment after the message: look again then
+              {
+                  Fl::remove_timeout(timer_cb, this);
+                  Fl::add_timeout(0.7, timer_cb, this);
+              }
+
+              void save()
+              {
+                  std::string n = nameinput->value() ? nameinput->value() : "";
+                  for(size_t i = 0; i < n.size(); ++i)
+                      if(strchr("\\/:*?\"<>|", n[i]))
+                          n[i] = '_';
+                  while(!n.empty() && n[0] == ' ')
+                      n.erase(0, 1);
+                  while(!n.empty() && n[n.size() - 1] == ' ')
+                      n.erase(n.size() - 1);
+                  if(n.empty()) {
+                      info->copy_label("Type a name first, then press Save.");
+                      redraw();
+                      return;
+                  }
+                  osc->write("/presets/copy", "ss", loc.c_str(), n.c_str());
+                  pending = n;
+                  later();
+              }
+
+              void remove()
+              {
+                  const int v = list->value();
+                  if(v < 1 || v > (int)names.size())
+                      return;
+                  if(fl_choice("Delete \"%s\"?", "Cancel", "Delete", 0, names[v - 1].c_str()) != 1)
+                      return;
+                  osc->write("/presets/delete", "s", (zynnm_waveform_dir() + "/" + names[v - 1] + ".zwav").c_str());
+                  later();
+              }
+
+              void picked()
+              {
+                  const int v = list->value();
+                  if(v < 1 || v > (int)names.size() || !osc)
+                      return;
+                  osc->write("/presets/paste", "ss", loc.c_str(),
+                             (zynnm_waveform_dir() + "/" + names[v - 1] + ".zwav").c_str());
+                  nameinput->value(names[v - 1].c_str());   // so Save writes over it
+                  do_callback();                            // the oscillator editor refreshes its display
+              }
+
+              static void list_cb(Fl_Widget *, void *d) { ((HarmonicPanel *)d)->picked(); }
+              static void save_cb(Fl_Widget *, void *d) { ((HarmonicPanel *)d)->save(); }
+              static void del_cb(Fl_Widget *, void *d) { ((HarmonicPanel *)d)->remove(); }
+              static void timer_cb(void *d) { ((HarmonicPanel *)d)->scan(); }
+
+              Fl_Osc_Interface        *osc;
+              std::string              loc;
+              std::string              pending;
+              std::vector<std::string> names;
+              Fl_Box                  *title;
+              Fl_Box                  *info;
+              Fl_Box                  *namelabel;
+              Fl_Input                *nameinput;
+              Fl_Hold_Browser         *list;
+              Fl_Button               *savebtn;
+              Fl_Button               *delbtn;
+          };
+          HEOF
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # folder of the saved waveforms for the editor (the synth uses the same rules in PresetsStore.cpp)
+          sub1('src/zyn_paths.h', '// a table is named like',
+               '''static inline std::string zynnm_waveform_dir()
+          {
+              static std::string dir;
+              if(dir.empty())
+                  dir = zynnm_pick_dir("ZYNNM_WAVEFORMS", "Waveforms");
+              return dir;
+          }
+
+          // a table is named like''')
+
+          # the waveform file must be written even when no preset folder is configured
+          P = 'src/Params/PresetsStore.cpp'
+          sub1(P, '''    if(config.cfg.presetsDirList[0].empty())
+                  return;
+
+              //make the filenames legal
+              name = legalizeFilename(name);
+
+              //an oscillator is saved as a waveform file: plain XML, the whole oscillator
+              //(base function, custom base wave, harmonics, modulation, waveshaping, filter)
+              if(!strcmp(type, "Poscilgen")) {
+                  xml.saveXMLfile(zwavDir() + "/" + name + ".zwav", 0);
+                  return;
+              }
+          ''', '''    //make the filenames legal
+              name = legalizeFilename(name);
+
+              //an oscillator is saved as a waveform file: plain XML, the whole oscillator
+              //(base function, custom base wave, harmonics, modulation, waveshaping, filter)
+              if(!strcmp(type, "Poscilgen")) {
+                  xml.saveXMLfile(zwavDir() + "/" + name + ".zwav", 0);
+                  return;
+              }
+
+              if(config.cfg.presetsDirList[0].empty())
+                  return;
+          ''')
+
+          # the panel class
+          W = 'src/UI/WavetablePanel.h'
+          s = rd(W)
+          s = s.replace('#include <FL/Fl_Hold_Browser.H>\n', '#include <FL/Fl_Hold_Browser.H>\n#include <FL/Fl_Input.H>\n#include <FL/fl_ask.H>\n', 1)
+          wr(W, s + open('/tmp/zynnm_files/harm_panel.h').read())
+
+          # the editor: two columns to the right of the oscillator
+          F = 'src/UI/OscilGenUI.fl'
+          sub1(F, '''if(Fl::w() >= 1350) {   // big screen: the wavetable list sits to the right of the editor
+              osceditUI->size(1042, 595);
+              osceditUI->begin();
+              WavetablePanel *wtp = new WavetablePanel(740, 0, 300, 595, osc, loc);
+              osceditUI->end();
+              wtp->callback([](Fl_Widget *, void *d) {
+                  OscilEditor *e = (OscilEditor *)d;
+                  e->bftype->update();
+                  e->bfpar->update();
+                  e->refresh();
+              }, this);
+          }''', '''if(Fl::w() >= 1350) {   // big screen: the wavetable list and the saved harmonics sit to the right of the editor
+              osceditUI->size(1318, 595);
+              osceditUI->begin();
+              WavetablePanel *wtp = new WavetablePanel(740, 0, 300, 595, osc, loc);
+              HarmonicPanel *hp = new HarmonicPanel(1044, 0, 270, 595, osc, loc);
+              osceditUI->end();
+              Fl_Callback *again = [](Fl_Widget *, void *d) {
+                  OscilEditor *e = (OscilEditor *)d;
+                  e->bftype->update();
+                  e->bfpar->update();
+                  e->refresh();
+              };
+              wtp->callback(again, this);
+              hp->callback(again, this);
+          }''')
+          print('stage 19 patches applied')
+          PYEOF
+
+      - name: "Stage 20 (no empty envelope strip, shorter window, 7-octave piano)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          U = 'src/UI/UnifiedShell.cpp'
+          # no empty envelope strip at the bottom: the envelope graph lives in the engine pages. The window gets 96+8 px lower.
+          sub1(U, '    fprintf(stderr, "[UI] envelope strip: %s\\n", envmode ? "on" : "off");\n',
+               '''    if(big && !envmode) {   // the envelope graph is inside the engine pages: no strip under them
+                  STRIP_H = 0;
+                  WIN_H   = 816;
+              }
+              fprintf(stderr, "[UI] envelope strip: %s\\n", envmode ? "on" : "off");
+          ''')
+          sub1(U, '    strip->labelsize(12);\n\n    if(envmode) {', '    strip->labelsize(12);\n    if(STRIP_H == 0)\n        strip->hide();\n\n    if(envmode) {')
+
+          # the plugin window gets the same height
+          sub1('DPF/distrho/src/zyn_vst_editor.h', '        fH = big ? 912 : 680;\n', '        fH = big ? 816 : 680;\n')
+          sub1('DPF/distrho/src/zyn_vst_editor.h', 'work area >= 1350x950 -> 1366x912, else 1000x680', 'work area >= 1350x950 -> 1366x816, else 1000x680')
+
+          # piano: 7 octaves (50 white keys, narrower keys) instead of 6
+          V = 'src/UI/VirKeyboard.fl'
+          sub1(V, 'decl {static const int N_OCT=6;} {private local', 'decl {static const int N_OCT=7;} {private local')
+          sub1(V, 'if (nk>=N_OCT*12) return;\nif ((nk<0)&&(exclusive==0)) {', 'if (nk>=N_OCT*12) return;\nif (nk+midioct*12>127) return;   // no note above MIDI 127\nif ((nk<0)&&(exclusive==0)) {')
+          print('stage 20 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
