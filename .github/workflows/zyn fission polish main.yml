@@ -3932,6 +3932,253 @@ jobs:
           print('stage 21 patches applied')
           PYEOF
 
+      - name: "Stage 22 (name and author notes typed in a window of their own, keyboard focus on every click)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          mkdir -p /tmp/zynnm_files
+          cat > /tmp/zynnm_files/zyn_text_dialog.h <<'HEOF'
+
+          // ---- a small native window to type text in (name of a saved waveform, author and comments) ------------------
+          // Inside a plugin the editor sits in the DAW's window and the DAW keeps the keyboard, so typing into a box of the
+          // editor does not work. A window of its own always gets the keyboard.
+          #include <string>
+
+          struct ZynTextDlg
+          {
+              std::string text;
+              bool        ok;
+              bool        multi;
+              HWND        edit;
+          };
+
+          static std::string zyn_to_crlf(const std::string &s)
+          {
+              std::string o;
+              for(size_t i = 0; i < s.size(); ++i) {
+                  if(s[i] == '\n' && (i == 0 || s[i - 1] != '\r'))
+                      o += '\r';
+                  o += s[i];
+              }
+              return o;
+          }
+
+          static std::string zyn_from_crlf(const std::string &s)
+          {
+              std::string o;
+              for(size_t i = 0; i < s.size(); ++i)
+                  if(s[i] != '\r')
+                      o += s[i];
+              return o;
+          }
+
+          static LRESULT CALLBACK zyn_text_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+          {
+              ZynTextDlg *d = (ZynTextDlg *)GetWindowLongPtrA(h, GWLP_USERDATA);
+              switch(m) {
+                  case WM_CREATE: {
+                      d = (ZynTextDlg *)((CREATESTRUCTA *)l)->lpCreateParams;
+                      SetWindowLongPtrA(h, GWLP_USERDATA, (LONG_PTR)d);
+                      HINSTANCE inst = GetModuleHandleA(NULL);
+                      HFONT     font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                      RECT rc;
+                      GetClientRect(h, &rc);
+                      const int W = rc.right, H = rc.bottom;
+                      DWORD es = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOVSCROLL;
+                      es |= d->multi ? (DWORD)(ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL) : (DWORD)ES_AUTOHSCROLL;
+                      d->edit = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", d->text.c_str(), es, 10, 10, W - 20, H - 60, h,
+                                                (HMENU)100, inst, NULL);
+                      HWND ok = CreateWindowA("BUTTON", "OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                              W - 190, H - 40, 85, 28, h, (HMENU)IDOK, inst, NULL);
+                      HWND ca = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                              W - 95, H - 40, 85, 28, h, (HMENU)IDCANCEL, inst, NULL);
+                      SendMessageA(d->edit, WM_SETFONT, (WPARAM)font, TRUE);
+                      SendMessageA(ok, WM_SETFONT, (WPARAM)font, TRUE);
+                      SendMessageA(ca, WM_SETFONT, (WPARAM)font, TRUE);
+                      return 0;
+                  }
+                  case WM_COMMAND:
+                      if(LOWORD(w) == IDOK && d) {
+                          const int n = GetWindowTextLengthA(d->edit);
+                          std::string s((size_t)n + 1, '\0');
+                          GetWindowTextA(d->edit, &s[0], n + 1);
+                          s.resize((size_t)n);
+                          d->text = s;
+                          d->ok   = true;
+                          DestroyWindow(h);
+                      } else if(LOWORD(w) == IDCANCEL)
+                          DestroyWindow(h);
+                      return 0;
+                  case WM_CLOSE:
+                      DestroyWindow(h);
+                      return 0;
+              }
+              return DefWindowProcA(h, m, w, l);
+          }
+
+          // shows the window and waits for OK or Cancel; true when OK was pressed (text holds the new text)
+          static bool zyn_win_text_input(const char *title, std::string &text, bool multi)
+          {
+              static bool registered = false;
+              HINSTANCE   inst       = GetModuleHandleA(NULL);
+              if(!registered) {
+                  WNDCLASSA wc;
+                  memset(&wc, 0, sizeof(wc));
+                  wc.lpfnWndProc   = zyn_text_proc;
+                  wc.hInstance     = inst;
+                  wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+                  wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+                  wc.lpszClassName = "ZynTextInput";
+                  if(!RegisterClassA(&wc))
+                      return false;
+                  registered = true;
+              }
+              ZynTextDlg d;
+              d.ok    = false;
+              d.multi = multi;
+              d.edit  = NULL;
+              d.text  = zyn_to_crlf(text);
+              const int W  = multi ? 520 : 440;
+              const int H  = multi ? 340 : 140;
+              const int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
+              const int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 2;
+              HWND h = CreateWindowExA(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, "ZynTextInput", title ? title : "Text",
+                                       WS_POPUP | WS_CAPTION | WS_SYSMENU, sx, sy, W, H, NULL, NULL, inst, &d);
+              if(!h)
+                  return false;
+              ShowWindow(h, SW_SHOW);
+              SetForegroundWindow(h);
+              SetFocus(d.edit);
+              SendMessageA(d.edit, EM_SETSEL, 0, -1);
+              MSG  msg;
+              BOOL r;
+              while(IsWindow(h) && (r = GetMessageA(&msg, NULL, 0, 0)) != 0) {
+                  if(r < 0)
+                      break;
+                  if(!IsDialogMessageA(h, &msg)) {
+                      TranslateMessage(&msg);
+                      DispatchMessageA(&msg);
+                  }
+              }
+              if(IsWindow(h))
+                  DestroyWindow(h);
+              if(!d.ok)
+                  return false;
+              text = zyn_from_crlf(d.text);
+              return true;
+          }
+          HEOF
+          cat > /tmp/zynnm_files/ZynPopupInput.h <<'HEOF'
+          #pragma once
+          // ZYNNM XT: a text box that opens a small window of its own to type in (see zyn_winfile.h).
+          // Used for the instrument author notes: typing straight into the editor does not reach it inside a DAW.
+          #include <FL/Fl.H>
+          #include <FL/Fl_Input.H>
+          #include <string>
+          #include "Fl_Osc_Input.H"
+          #ifdef _WIN32
+          #include "zyn_winfile.h"
+          #endif
+
+          class ZynPopupInput : public Fl_Osc_Input
+          {
+          public:
+              ZynPopupInput(int X, int Y, int W, int H, const char *label = NULL)
+                  : Fl_Osc_Input(X, Y, W, H, label), swallow(false) {}
+
+              int handle(int ev) override
+              {
+          #ifdef _WIN32
+                  if(ev == FL_PUSH && Fl::event_button() == FL_LEFT_MOUSE && active()) {
+                      std::string t = value() ? value() : "";
+                      if(zyn_win_text_input(label() ? label() : "Text", t, true)) {
+                          const int mx = maximum_size();
+                          if(mx > 0 && (int)t.size() > mx)
+                              t.resize((size_t)mx);
+                          value(t.c_str());
+                          do_callback();      // sends the text to the synth
+                      }
+                      swallow = true;
+                      return 1;
+                  }
+                  if(swallow && (ev == FL_DRAG || ev == FL_RELEASE)) {
+                      if(ev == FL_RELEASE)
+                          swallow = false;
+                      return 1;
+                  }
+          #endif
+                  return Fl_Osc_Input::handle(ev);
+              }
+
+          private:
+              bool swallow;
+          };
+          HEOF
+          python3 - <<'PYEOF'
+          import shutil
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # native text window + the text box class
+          wr('src/UI/zyn_winfile.h', rd('src/UI/zyn_winfile.h') + open('/tmp/zynnm_files/zyn_text_dialog.h').read())
+          shutil.copy('/tmp/zynnm_files/ZynPopupInput.h', 'src/UI/ZynPopupInput.h')
+
+          # author notes: the two boxes open the text window when clicked
+          F = 'src/UI/PartUI.fl'
+          sub1(F, 'decl {\\#include "UnifiedShell.h"} {public local\n}\n',
+               'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "ZynPopupInput.h"} {private local\n}\n')
+          # (private: windows.h must not leak into every file that includes the generated headers)
+          sub1('src/UI/OscilGenUI.fl', 'decl {\\#include "WavetablePanel.h"} {public local', 'decl {\\#include "WavetablePanel.h"} {private local')
+          s = rd(F)
+          for key in ('code1 {o->init("info.Pauthor");}', 'code1 {o->init("info.Pcomments");}'):
+              a = s.index(key)
+              b = s.index('class Fl_Osc_Input', a)
+              assert b - a < 200, key
+              s = s[:b] + 'class ZynPopupInput' + s[b + len('class Fl_Osc_Input'):]
+          wr(F, s)
+
+          # saved harmonics: Save opens the same window for the name
+          W = 'src/UI/WavetablePanel.h'
+          sub1(W, '#include "../zyn_paths.h"\n', '#include "../zyn_paths.h"\n#ifdef _WIN32\n#include "zyn_winfile.h"\n#endif\n')
+          sub1(W, '''        std::string n = nameinput->value() ? nameinput->value() : "";
+                  for(size_t i = 0; i < n.size(); ++i)''', '''        std::string n = nameinput->value() ? nameinput->value() : "";
+          #ifdef _WIN32
+                  if(!zyn_win_text_input("Save harmonics as", n, false))   // typing in the editor does not reach it in a DAW
+                      return;
+                  nameinput->value(n.c_str());
+          #endif
+                  for(size_t i = 0; i < n.size(); ++i)''')
+
+          # the editor takes the keyboard focus on every click (a text box consumed the click before, so the old handler never ran)
+          G = 'src/UI/guimain.cpp'
+          sub1(G, '''static int zyn_focus_handler(int ev)
+          {
+              if(ev == FL_PUSH && zyn_sync_ui && zyn_sync_ui->masterwindow && zyn_sync_ui->masterwindow->shown()) {
+                  HWND h = fl_xid(zyn_sync_ui->masterwindow);
+                  if(h && GetFocus() != h)
+                      SetFocus(h);
+              }
+              return 0;   // the click itself is still handled as usual
+          }''', '''static int zyn_dispatch(int ev, Fl_Window *w)
+          {
+              if(ev == FL_PUSH && zyn_sync_ui && zyn_sync_ui->masterwindow && zyn_sync_ui->masterwindow->shown()) {
+                  HWND h = fl_xid(zyn_sync_ui->masterwindow);
+                  if(h && GetFocus() != h)
+                      SetFocus(h);
+              }
+              return Fl::handle_(ev, w);   // the event is handled as usual
+          }''')
+          sub1(G, '                Fl::add_handler(zyn_focus_handler);\n', '                Fl::event_dispatch(zyn_dispatch);\n')
+          sub1(G, '    Fl::remove_handler(zyn_focus_handler);\n', '    Fl::event_dispatch(0);\n')
+          print('stage 22 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
