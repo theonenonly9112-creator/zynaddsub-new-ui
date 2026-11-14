@@ -4132,7 +4132,7 @@ jobs:
           # author notes: the two boxes open the text window when clicked
           F = 'src/UI/PartUI.fl'
           sub1(F, 'decl {\\#include "UnifiedShell.h"} {public local\n}\n',
-               'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {\\#include "ZynPopupInput.h"} {private local\n}\n')
+               'decl {\\#include "UnifiedShell.h"} {public local\n}\n\ndecl {class ZynPopupInput;} {public local\n}\n\ndecl {\\#include "ZynPopupInput.h"} {private local\n}\n')
           # (private: windows.h must not leak into every file that includes the generated headers)
           sub1('src/UI/OscilGenUI.fl', 'decl {\\#include "WavetablePanel.h"} {public local', 'decl {\\#include "WavetablePanel.h"} {private local')
           s = rd(F)
