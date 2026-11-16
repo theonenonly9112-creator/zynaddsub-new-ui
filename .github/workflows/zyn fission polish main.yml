@@ -4179,6 +4179,481 @@ jobs:
           print('stage 22 patches applied')
           PYEOF
 
+      - name: Stage 23 (author notes and description window when saving a preset)
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+
+          def wr(p, s):
+              open(p, 'w').write(s)
+
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # ---------------------------------------------------------------- one window with both notes (Windows API)
+          WF = 'src/UI/zyn_winfile.h'
+          NOTES = r'''
+
+          // ---- ZYNNM XT: "Save preset" notes window: author and description side by side ----
+          struct ZynNotesDlg
+          {
+              std::string author, desc;
+              bool        ok;
+              HWND        e1, e2;
+          };
+
+          static std::string zyn_get_edit(HWND e)
+          {
+              const int n = GetWindowTextLengthA(e);
+              std::string s((size_t)n + 1, '\0');
+              GetWindowTextA(e, &s[0], n + 1);
+              s.resize((size_t)n);
+              return s;
+          }
+
+          static LRESULT CALLBACK zyn_notes_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+          {
+              ZynNotesDlg *d = (ZynNotesDlg *)GetWindowLongPtrA(h, GWLP_USERDATA);
+              switch(m) {
+                  case WM_CREATE: {
+                      d = (ZynNotesDlg *)((CREATESTRUCTA *)l)->lpCreateParams;
+                      SetWindowLongPtrA(h, GWLP_USERDATA, (LONG_PTR)d);
+                      HINSTANCE inst = GetModuleHandleA(NULL);
+                      HFONT     font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+                      RECT rc;
+                      GetClientRect(h, &rc);
+                      const int W  = rc.right, H = rc.bottom;
+                      const int cw = (W - 30) / 2;
+                      DWORD es = WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOVSCROLL | ES_MULTILINE | ES_WANTRETURN | WS_VSCROLL;
+                      HWND t1 = CreateWindowA("STATIC", "Author and copyright", WS_CHILD | WS_VISIBLE, 10, 8, cw, 18, h,
+                                              NULL, inst, NULL);
+                      HWND t2 = CreateWindowA("STATIC", "Description / comments", WS_CHILD | WS_VISIBLE, 20 + cw, 8, cw, 18, h,
+                                              NULL, inst, NULL);
+                      d->e1 = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", d->author.c_str(), es, 10, 28, cw, H - 80, h,
+                                              (HMENU)100, inst, NULL);
+                      d->e2 = CreateWindowExA(WS_EX_CLIENTEDGE, "EDIT", d->desc.c_str(), es, 20 + cw, 28, cw, H - 80, h,
+                                              (HMENU)101, inst, NULL);
+                      HWND ok = CreateWindowA("BUTTON", "Save...", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+                                              W - 190, H - 40, 85, 28, h, (HMENU)IDOK, inst, NULL);
+                      HWND ca = CreateWindowA("BUTTON", "Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+                                              W - 95, H - 40, 85, 28, h, (HMENU)IDCANCEL, inst, NULL);
+                      HWND all[6] = {t1, t2, d->e1, d->e2, ok, ca};
+                      for(int i = 0; i < 6; ++i)
+                          SendMessageA(all[i], WM_SETFONT, (WPARAM)font, TRUE);
+                      return 0;
+                  }
+                  case WM_COMMAND:
+                      if(LOWORD(w) == IDOK && d) {
+                          d->author = zyn_from_crlf(zyn_get_edit(d->e1));
+                          d->desc   = zyn_from_crlf(zyn_get_edit(d->e2));
+                          d->ok     = true;
+                          DestroyWindow(h);
+                      } else if(LOWORD(w) == IDCANCEL)
+                          DestroyWindow(h);
+                      return 0;
+                  case WM_CLOSE:
+                      DestroyWindow(h);
+                      return 0;
+              }
+              return DefWindowProcA(h, m, w, l);
+          }
+
+          // shows the window and waits; true when "Save..." was pressed (author / desc hold the new texts)
+          static bool zyn_win_notes_input(std::string &author, std::string &desc)
+          {
+              static bool registered = false;
+              HINSTANCE   inst       = GetModuleHandleA(NULL);
+              if(!registered) {
+                  WNDCLASSA wc;
+                  memset(&wc, 0, sizeof(wc));
+                  wc.lpfnWndProc   = zyn_notes_proc;
+                  wc.hInstance     = inst;
+                  wc.hCursor       = LoadCursorA(NULL, IDC_ARROW);
+                  wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+                  wc.lpszClassName = "ZynNotesInput";
+                  if(!RegisterClassA(&wc))
+                      return false;
+                  registered = true;
+              }
+              ZynNotesDlg d;
+              d.author = zyn_to_crlf(author);
+              d.desc   = zyn_to_crlf(desc);
+              d.ok     = false;
+              d.e1     = NULL;
+              d.e2     = NULL;
+              const int W  = 700;
+              const int H  = 440;
+              const int sx = (GetSystemMetrics(SM_CXSCREEN) - W) / 2;
+              const int sy = (GetSystemMetrics(SM_CYSCREEN) - H) / 2;
+              HWND h = CreateWindowExA(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, "ZynNotesInput", "Save preset - notes",
+                                       WS_POPUP | WS_CAPTION | WS_SYSMENU, sx, sy, W, H, NULL, NULL, inst, &d);
+              if(!h)
+                  return false;
+              ShowWindow(h, SW_SHOW);
+              SetForegroundWindow(h);
+              SetFocus(d.e1);
+              MSG  msg;
+              BOOL r;
+              while(IsWindow(h) && (r = GetMessageA(&msg, NULL, 0, 0)) != 0) {
+                  if(r < 0)
+                      break;
+                  if(!IsDialogMessageA(h, &msg)) {
+                      TranslateMessage(&msg);
+                      DispatchMessageA(&msg);
+                  }
+              }
+              if(IsWindow(h))
+                  DestroyWindow(h);
+              if(!d.ok)
+                  return false;
+              author = d.author;
+              desc   = d.desc;
+              return true;
+          }
+          '''
+          wr(WF, rd(WF).rstrip('\n') + '\n' + NOTES)
+
+          # ---------------------------------------------------------------- name the two boxes so the Save action can reach them
+          PU = 'src/UI/PartUI.fl'
+          sub1(PU, 'Fl_Input {} {\n          label {Author and Copyright}', 'Fl_Input PauthorBox {\n          label {Author and Copyright}')
+          sub1(PU, 'Fl_Input {} {\n          label Comments\n          xywh {5 125 385 90}', 'Fl_Input PcommentsBox {\n          label Comments\n          xywh {5 125 385 90}')
+
+          # ---------------------------------------------------------------- Save Instrument: ask for the notes first
+          MU = 'src/UI/MasterUI.fl'
+          sub1(MU, 'decl {\\#include "zyn_winfile.h"} {private local\n} \n',
+               'decl {\\#include "zyn_winfile.h"} {private local\n} \n\ndecl {\\#include "ZynPopupInput.h"} {private local\n} \n')
+          ASK = '''callback {static std::string zyn_last_author;
+          if (partui && partui->PauthorBox && partui->PcommentsBox) {
+              std::string zan = partui->PauthorBox->value() ? partui->PauthorBox->value() : "";
+              std::string zcm = partui->PcommentsBox->value() ? partui->PcommentsBox->value() : "";
+              if (zan.empty()) zan = zyn_last_author;
+              if (!zyn_win_notes_input(zan, zcm)) return;
+              const int zmx1 = partui->PauthorBox->maximum_size();
+              const int zmx2 = partui->PcommentsBox->maximum_size();
+              if (zmx1 > 0 && (int)zan.size() > zmx1) zan.resize((size_t)zmx1);
+              if (zmx2 > 0 && (int)zcm.size() > zmx2) zcm.resize((size_t)zmx2);
+              zyn_last_author = zan;
+              partui->PauthorBox->value(zan.c_str());
+              partui->PauthorBox->do_callback();
+              partui->PcommentsBox->value(zcm.c_str());
+              partui->PcommentsBox->do_callback();
+          }
+          char *filename;
+
+          filename=fl_file_chooser("Save:","({*.xiz})",NULL,0);'''
+          sub1(MU, 'callback {char *filename;\n\nfilename=fl_file_chooser("Save:","({*.xiz})",NULL,0);', ASK)
+          print('stage 23 patches applied')
+          PYEOF
+
+      - name: Stage 24 (automation routing - tweaked knobs bind to host parameters)
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+
+          def wr(p, s):
+              open(p, 'w').write(s)
+
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # ================================================================ 1. synth side: 64 automation slots + silent binding port
+          M = 'src/Misc/Master.cpp'
+          sub1(M, 'automate(16,4,8),', 'automate(64,4,8),')
+          sub1(M, '{"slot#16/",', '{"slot#64/",')
+          sub1(M, '    {"learn-binding-same-slot:s", rDoc("Learn a parameter appending to the active-slot"), 0,',
+               '    {"auto-bind:isf", rDoc("Bind a parameter to a slot without midi-learn (ZYNNM XT automatic routing)"), 0,\n'
+               '        rBegin;\n'
+               '        const int zslot = rtosc_argument(msg, 0).i;\n'
+               '        if(zslot >= 0 && zslot < 64) {\n'
+               '            a.clearSlot(zslot);\n'
+               '            a.createBinding(zslot, rtosc_argument(msg, 1).s, false);\n'
+               '            a.slots[zslot].current_state = rtosc_argument(msg, 2).f;\n'
+               '        }\n'
+               '        rEnd},\n'
+               '    {"learn-binding-same-slot:s", rDoc("Learn a parameter appending to the active-slot"), 0,')
+
+          # ================================================================ 2. middleware: every knob the user moves gets a slot
+          MH = 'src/Misc/MiddleWare.h'
+          sub1(MH, 'void setIdleCallback(void(*cb)(void*),void *ptr);',
+               'void setIdleCallback(void(*cb)(void*),void *ptr);\n'
+               '        //Called when the user moves a parameter in the editor: (user, slot, value 0..1, osc path)\n'
+               '        void setHostNotify(void(*cb)(void*,int,float,const char *),void *user);')
+
+          MC = 'src/Misc/MiddleWare.cpp'
+          sub1(MC, '    void handleMsg(const char *msg);\n',
+               '    void handleMsg(const char *msg);\n'
+               '    void autoRoute(const char *msg);\n'
+               '    void (*hostNotify)(void*, int, float, const char *) = 0;\n'
+               '    void *hostNotifyUser = 0;\n'
+               '    unsigned long routeStamp[64] = {0};\n'
+               '    unsigned long routeCounter = 0;\n')
+          sub1(MC, '    assert(strcmp(msg, "Psysefxvol0/part0"));\n',
+               '    assert(strcmp(msg, "Psysefxvol0/part0"));\n\n    if(hostNotify)\n        autoRoute(msg);\n')
+
+          ROUTE = r'''// ZYNNM XT: a parameter the user moved in the editor is bound to a free automation slot (no midi-learn)
+          // and the host is told, so "last tweaked parameter" (FL Studio) and the automation list (LMMS) work.
+          void MiddleWareImpl::autoRoute(const char *msg)
+          {
+              const char *args = rtosc_argument_string(msg);
+              if(!args || !args[0] || args[1])                 // exactly one argument (T and F count as one)
+                  return;
+              const char type = args[0];
+              if(type != 'i' && type != 'f' && type != 'T' && type != 'F')
+                  return;
+              if(msg[0] != '/' || !strncmp(msg, "/automate/", 10) || !strncmp(msg, "/damage", 7))
+                  return;
+
+              const rtosc::Port *port = Master::ports.apropos(msg);
+              if(!port)
+                  return;
+              auto meta = port->meta();
+              if(meta.find("internal") || meta.find("no learn"))
+                  return;
+              float mn = 0.0f, mx = 1.0f;
+              if(type == 'T' || type == 'F') {
+                  if(!strstr(port->name, ":T"))
+                      return;
+              } else {
+                  if(!(meta.find("min") && meta.find("max")))
+                      return;
+                  mn = (float)atof(meta["min"]);
+                  mx = (float)atof(meta["max"]);
+                  if(!(mx > mn))
+                      return;
+              }
+
+              float norm;
+              if(type == 'T')
+                  norm = 1.0f;
+              else if(type == 'F')
+                  norm = 0.0f;
+              else {
+                  const float v = (type == 'i') ? (float)rtosc_argument(msg, 0).i : rtosc_argument(msg, 0).f;
+                  norm = (v - mn) / (mx - mn);
+              }
+              if(norm < 0.0f)
+                  norm = 0.0f;
+              else if(norm > 1.0f)
+                  norm = 1.0f;
+
+              auto &am = master->automate;
+              int slot = -1;
+              for(int s = 0; s < 64 && slot < 0; ++s) {
+                  if(!am.slots[s].used)
+                      continue;
+                  for(int j = 0; j < 4; ++j) {
+                      if(am.slots[s].automations[j].used && !strcmp(am.slots[s].automations[j].param_path, msg)) {
+                          slot = s;
+                          break;
+                      }
+                  }
+              }
+
+              if(slot < 0) {                                   // not routed yet: take a free slot, else the oldest one
+                  for(int s = 0; s < 64; ++s) {
+                      if(!am.slots[s].used) {
+                          slot = s;
+                          break;
+                      }
+                  }
+                  if(slot < 0) {
+                      slot = 0;
+                      for(int s = 1; s < 64; ++s)
+                          if(routeStamp[s] < routeStamp[slot])
+                              slot = s;
+                  }
+                  char buf[512];
+                  rtosc_message(buf, sizeof(buf), "/automate/auto-bind", "isf", slot, msg, norm);
+                  handleMsg(buf);                              // goes to the synth like any other message
+              } else {
+                  int used = 0;
+                  for(int j = 0; j < 4; ++j)
+                      if(am.slots[slot].automations[j].used)
+                          used++;
+                  if(used != 1)                                // a macro slot (several parameters): leave it alone
+                      return;
+                  am.slots[slot].current_state = norm;
+              }
+              routeStamp[slot] = ++routeCounter;
+              hostNotify(hostNotifyUser, slot, norm, msg);
+          }
+
+          '''
+          sub1(MC, 'void MiddleWareImpl::write(const char *path, const char *args, ...)\n{', ROUTE + 'void MiddleWareImpl::write(const char *path, const char *args, ...)\n{')
+          sub1(MC, 'void MiddleWare::setIdleCallback(void(*cb)(void*), void *ptr)\n{\n    impl->idle     = cb;\n    impl->idle_ptr = ptr;\n}\n',
+               'void MiddleWare::setIdleCallback(void(*cb)(void*), void *ptr)\n{\n    impl->idle     = cb;\n    impl->idle_ptr = ptr;\n}\n\n'
+               'void MiddleWare::setHostNotify(void(*cb)(void*,int,float,const char *), void *user)\n{\n    impl->hostNotifyUser = user;\n    impl->hostNotify     = cb;\n}\n')
+
+          # ================================================================ 3. plugin: 64 slots, notify queue, slot names
+          PI = 'src/Plugin/ZynAddSubFX/DistrhoPluginInfo.h'
+          s = rd(PI)
+          start = s.index('    kParamSlot1,\n')
+          end = s.index('    kParamSlot16,\n') + len('    kParamSlot16,\n')
+          wr(PI, s[:start] + '    kParamSlot1,\n    kParamSlotLast = kParamSlot1 + 63,   // 64 automation slots\n' + s[end:])
+
+          PC = 'src/Plugin/ZynAddSubFX/ZynAddSubFX.cpp'
+          sub1(PC, 'index <= kParamSlot16', 'index <= kParamSlotLast', 3)
+          sub1(PC, '#include <lo/lo.h>\n', '#include <lo/lo.h>\n#include <atomic>\n#include <string.h>\n')
+          sub1(PC, 'class ZynAddSubFX : public Plugin\n{\npublic:\n',
+               'class ZynAddSubFX : public Plugin\n{\npublic:\n'
+               '    // ---- ZYNNM XT: knob moved in the editor -> host automation slot ----\n'
+               '    std::atomic<float>              notifyVal[64];\n'
+               '    std::atomic<unsigned long long> notifyDirty;\n'
+               '    char                            slotLast[64][128];\n'
+               '\n'
+               '    static void hostNotifyThunk(void *self, int slot, float norm, const char *path)\n'
+               '    {\n'
+               '        ZynAddSubFX *z = static_cast<ZynAddSubFX *>(self);\n'
+               '        if(!z || slot < 0 || slot >= 64)\n'
+               '            return;\n'
+               '        if(path && strncmp(z->slotLast[slot], path, 127)) {\n'
+               '            strncpy(z->slotLast[slot], path, 127);\n'
+               '            z->slotLast[slot][127] = 0;\n'
+               '            zyn_plog("[AUTO] slot %d = %s", slot + 1, path);\n'
+               '        }\n'
+               '        z->notifyVal[slot].store(norm);\n'
+               '        z->notifyDirty.fetch_or(1ULL << slot);\n'
+               '    }\n'
+               '\n'
+               '    bool popNotify(int *slot, float *val)\n'
+               '    {\n'
+               '        const unsigned long long d = notifyDirty.load();\n'
+               '        for(int i = 0; i < 64; ++i) {\n'
+               '            if(d & (1ULL << i)) {\n'
+               '                notifyDirty.fetch_and(~(1ULL << i));\n'
+               '                *slot = i;\n'
+               '                *val  = notifyVal[i].load();\n'
+               '                return true;\n'
+               '            }\n'
+               '        }\n'
+               '        return false;\n'
+               '    }\n'
+               '\n'
+               '    bool slotName(int slot, char *buf, int n)\n'
+               '    {\n'
+               '        if(!master || slot < 0 || slot >= 64)\n'
+               '            return false;\n'
+               '        auto &sl = master->automate.slots[slot];\n'
+               '        if(!sl.used)\n'
+               '            return false;\n'
+               '        for(int j = 0; j < 4; ++j) {\n'
+               '            if(!sl.automations[j].used)\n'
+               '                continue;\n'
+               '            const char *p    = sl.automations[j].param_path;\n'
+               '            const char *tail = strrchr(p, \'/\');\n'
+               '            tail             = tail ? tail + 1 : p;\n'
+               '            if(!*tail)\n'
+               '                return false;\n'
+               '            snprintf(buf, (size_t)n, "S%d %s", slot + 1, tail);\n'
+               '            return true;\n'
+               '        }\n'
+               '        return false;\n'
+               '    }\n'
+               '\n')
+          sub1(PC, '        zyn_plog("ZynAddSubFX constructor: start");\n',
+               '        zyn_plog("ZynAddSubFX constructor: start");\n'
+               '        for(int i = 0; i < 64; ++i) {\n'
+               '            notifyVal[i].store(0.0f);\n'
+               '            slotLast[i][0] = 0;\n'
+               '        }\n'
+               '        notifyDirty.store(0ULL);\n')
+          sub1(PC, 'middleware = new zyn::MiddleWare(std::move(synth), &config);',
+               'middleware = new zyn::MiddleWare(std::move(synth), &config);\n'
+               '        middleware->setHostNotify(&ZynAddSubFX::hostNotifyThunk, this);')
+          sub1(PC, 'END_NAMESPACE_DISTRHO\n',
+               'END_NAMESPACE_DISTRHO\n\n'
+               '// called by the VST wrapper (DistrhoPluginVST.cpp)\n'
+               'bool zyn_plugin_pop_notify(void *inst, int *slot, float *val)\n{\n'
+               '    if(!inst)\n        return false;\n'
+               '    return static_cast<ZynAddSubFX *>(static_cast<Plugin *>(inst))->popNotify(slot, val);\n}\n\n'
+               'bool zyn_plugin_slot_name(void *inst, int slot, char *buf, int n)\n{\n'
+               '    if(!inst)\n        return false;\n'
+               '    return static_cast<ZynAddSubFX *>(static_cast<Plugin *>(inst))->slotName(slot, buf, n);\n}\n')
+
+          # ================================================================ 4. VST wrapper: tell the host (FL "last tweaked", LMMS automation) + names
+          V = 'DPF/distrho/src/DistrhoPluginVST.cpp'
+          sub1(V, '#include "zyn_vst_editor.h"\n\nSTART_NAMESPACE_DISTRHO',
+               '#include "zyn_vst_editor.h"\n\n'
+               'bool zyn_plugin_pop_notify(void *inst, int *slot, float *val);\n'
+               'bool zyn_plugin_slot_name(void *inst, int slot, char *buf, int n);\n\n'
+               'START_NAMESPACE_DISTRHO')
+          sub1(V, '            DISTRHO::strncpy((char*)ptr, plugin.getParameterName(index), 16);',
+               '            if (zyn_plugin_slot_name(plugin.getInstancePointer(), index, (char*)ptr, 16))\n'
+               '                return 1;\n'
+               '            DISTRHO::strncpy((char*)ptr, plugin.getParameterName(index), 16);')
+          sub1(V, '#if DISTRHO_OS_WINDOWS && ! DISTRHO_PLUGIN_HAS_UI\n    ZynExtEditor zynEditor;\n#endif',
+               '#if DISTRHO_OS_WINDOWS && ! DISTRHO_PLUGIN_HAS_UI\n    ZynExtEditor zynEditor;\n'
+               '    bool  zynEditing[64]  = {false};\n'
+               '    DWORD zynEditTick[64] = {0};\n'
+               '\n'
+               '    static void zynTickThunk(void *self)\n'
+               '    {\n'
+               '        static_cast<PluginVst *>(self)->zynFlushNotify();\n'
+               '    }\n'
+               '\n'
+               '    // runs on the host\'s UI thread (timer of the editor panel): knobs moved in the editor -> host\n'
+               '    void zynFlushNotify()\n'
+               '    {\n'
+               '        int   slot = 0;\n'
+               '        float val  = 0.0f;\n'
+               '        const DWORD now = GetTickCount();\n'
+               '        while(zyn_plugin_pop_notify(fPlugin.getInstancePointer(), &slot, &val)) {\n'
+               '            if(slot < 0 || slot >= 64)\n'
+               '                continue;\n'
+               '            if(!zynEditing[slot]) {\n'
+               '                hostCallback(audioMasterBeginEdit, kParamSlot1 + slot);\n'
+               '                zynEditing[slot] = true;\n'
+               '            }\n'
+               '            hostCallback(audioMasterAutomate, kParamSlot1 + slot, 0, nullptr, val);\n'
+               '            zynEditTick[slot] = now;\n'
+               '        }\n'
+               '        for(int i = 0; i < 64; ++i) {\n'
+               '            if(zynEditing[i] && now - zynEditTick[i] > 400) {\n'
+               '                hostCallback(audioMasterEndEdit, kParamSlot1 + i);\n'
+               '                zynEditing[i] = false;\n'
+               '            }\n'
+               '        }\n'
+               '    }\n'
+               '#endif')
+          sub1(V, '            zynEditor.open(ptr, int(fPlugin.getParameterValue(kParamOscPort) + 0.5f));',
+               '            zynEditor.hook.fn   = &PluginVst::zynTickThunk;\n'
+               '            zynEditor.hook.user = this;\n'
+               '            zynEditor.open(ptr, int(fPlugin.getParameterValue(kParamOscPort) + 0.5f));')
+
+          E = 'DPF/distrho/src/zyn_vst_editor.h'
+          sub1(E, 'static LRESULT CALLBACK zyn_panel_proc(HWND h, UINT m, WPARAM w, LPARAM l)\n{\n    switch(m) {\n',
+               'struct ZynTickHook\n{\n    void (*fn)(void *);\n    void *user;\n};\n\n'
+               'static LRESULT CALLBACK zyn_panel_proc(HWND h, UINT m, WPARAM w, LPARAM l)\n{\n    switch(m) {\n'
+               '    case WM_TIMER: {\n'
+               '        ZynTickHook *k = (ZynTickHook *)GetWindowLongPtrA(h, GWLP_USERDATA);\n'
+               '        if(k && k->fn)\n'
+               '            k->fn(k->user);\n'
+               '        return 0;\n'
+               '    }\n')
+          sub1(E, '    ERect *rect()\n    {\n        return &fRect;\n    }\n',
+               '    ZynTickHook hook = {NULL, NULL};   // called every 30 ms on the host\'s UI thread while the editor is open\n\n'
+               '    ERect *rect()\n    {\n        return &fRect;\n    }\n')
+          sub1(E, '        zyn_plog("editor open: parent %p, panel %p, osc port %d", parent, (void *)fHwnd, oscPort);\n',
+               '        zyn_plog("editor open: parent %p, panel %p, osc port %d", parent, (void *)fHwnd, oscPort);\n'
+               '        if(fHwnd) {\n'
+               '            SetWindowLongPtrA(fHwnd, GWLP_USERDATA, (LONG_PTR)&hook);\n'
+               '            SetTimer(fHwnd, 7001, 30, NULL);\n'
+               '        }\n')
+          sub1(E, '        if(fHwnd) {\n            DestroyWindow(fHwnd);',
+               '        if(fHwnd) {\n            KillTimer(fHwnd, 7001);\n            DestroyWindow(fHwnd);')
+          print('stage 24 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
