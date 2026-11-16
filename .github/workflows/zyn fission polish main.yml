@@ -4350,7 +4350,7 @@ jobs:
           print('stage 23 patches applied')
           PYEOF
 
-      - name: Stage 24 (automation routing - tweaked knobs bind to host parameters)
+      - name: Stage 24b (automation routing - tweaked knobs bind to host parameters)
         run: |
           cd zynaddsubfx-3.0.3
           python3 - <<'PYEOF'
@@ -4630,6 +4630,10 @@ jobs:
                '            zynEditor.hook.user = this;\n'
                '            zynEditor.open(ptr, int(fPlugin.getParameterValue(kParamOscPort) + 0.5f));')
 
+          # build stamp: the plugin log and BUILD-INFO.txt say which build a plugin file came from
+          sub1(V, 'zyn_plog("VSTPluginMain: ok, %d parameters, flags 0x%x", (int)numParams, (unsigned)effect->flags);',
+               'zyn_plog("VSTPluginMain: ok, %d parameters, flags 0x%x [ZYNNM XT build stage 24b: automation routing, 64 slots]", (int)numParams, (unsigned)effect->flags);')
+
           E = 'DPF/distrho/src/zyn_vst_editor.h'
           sub1(E, 'static LRESULT CALLBACK zyn_panel_proc(HWND h, UINT m, WPARAM w, LPARAM l)\n{\n    switch(m) {\n',
                'struct ZynTickHook\n{\n    void (*fn)(void *);\n    void *user;\n};\n\n'
@@ -4805,6 +4809,7 @@ jobs:
               fi
             done
           done
+          echo "ZYNNM XT build: stage 24b (automation routing, 64 slots)" > out/BUILD-INFO.txt
           mv out/zynaddsubfx.exe "out/ZYNNM XT.exe"
           if [ -f out/vst/ZynAddSubFX.dll ]; then mv out/vst/ZynAddSubFX.dll "out/vst/ZYNNM XT.dll"; fi
           if [ -f out/vst/zynaddsubfx-ext-gui.exe ]; then mv out/vst/zynaddsubfx-ext-gui.exe out/vst/ZYNNM-XT-editor.exe; fi
