@@ -72,6 +72,41 @@ jobs:
           cd $HOME/deps
           curl -fLO https://github.com/radarsat1/liblo/releases/download/0.32/liblo-0.32.tar.gz
           tar xzf liblo-0.32.tar.gz && cd liblo-0.32
+          python3 - <<'PYEOF'
+          import re
+          p = 'src/server.c'
+          s = open(p).read()
+          n = len(re.findall(r'\bbind\s*\(', s))
+          print('liblo server.c: bind() calls found:', n)
+          if n == 0:
+              print('WARNING: no bind() call found, liblo keeps listening on every address')
+          else:
+              s = re.sub(r'\bbind\s*\(', 'zyn_bind_loopback(', s)
+              helper = r'''
+          /* ZYNNM XT: a socket that would listen on "any address" listens on this computer only (127.0.0.1),
+             so the firewall does not ask whether the program may act as a server on the network */
+          static int zyn_bind_loopback(int fd, const struct sockaddr *addr, int len)
+          {
+              if(addr && addr->sa_family == AF_INET && len >= (int)sizeof(struct sockaddr_in)) {
+                  struct sockaddr_in a4;
+                  memcpy(&a4, addr, sizeof(a4));
+                  if(a4.sin_addr.s_addr == htonl(INADDR_ANY)) {
+                      a4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+                      return bind(fd, (struct sockaddr *)&a4, len);
+                  }
+              }
+              return bind(fd, addr, len);
+          }
+          '''
+              lines = s.split('\n')
+              last = 0
+              for i, l in enumerate(lines[:250]):
+                  if l.startswith('#include'):
+                      last = i
+              lines.insert(last + 1, helper)
+              open(p, 'w').write('\n'.join(lines))
+              print('liblo server.c patched: bind() now goes through zyn_bind_loopback')
+          PYEOF
           ./configure --prefix=/mingw32 --enable-shared --enable-static --disable-tests --disable-examples --disable-tools
           make -j4 && make install
       - name: Build fltk
@@ -4658,6 +4693,46 @@ jobs:
           print('stage 24 patches applied')
           PYEOF
 
+      - name: Stage 25 (no network port in the exe, no Close button in the engine windows)
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+
+          def wr(p, s):
+              open(p, 'w').write(s)
+
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # ---------------------------------------------------------------- standalone exe: no network port at all
+          MC = 'src/Misc/MiddleWare.cpp'
+          sub1(MC, 'namespace zyn {\n',
+               'int zyn_no_osc_server = 0;   // ZYNNM XT: 1 = this program opens no network port (standalone exe)\n\nnamespace zyn {\n')
+          sub1(MC, '    if(preferrred_port != -1)\n        server = zyn_lo_server_loopback(to_s(preferrred_port).c_str(), liblo_error_cb);\n    else\n        server = zyn_lo_server_loopback(NULL, liblo_error_cb);\n',
+               '    if(zyn_no_osc_server)\n        server = NULL;   // the editor of the standalone exe lives in this process: no network port is needed\n'
+               '    else if(preferrred_port != -1)\n        server = zyn_lo_server_loopback(to_s(preferrred_port).c_str(), liblo_error_cb);\n    else\n        server = zyn_lo_server_loopback(NULL, liblo_error_cb);\n')
+          MN = 'src/main.cpp'
+          sub1(MN, 'GUI::ui_handle_t gui;\n', 'extern int zyn_no_osc_server;\nGUI::ui_handle_t gui;\n')
+          sub1(MN, '    middleware = new MiddleWare(std::move(synth), config, prefered_port);',
+               '    zyn_no_osc_server = 1;   // no server socket -> no firewall question\n    middleware = new MiddleWare(std::move(synth), config, prefered_port);')
+
+          # ---------------------------------------------------------------- no Close button in the corner of ADD / SUB / PAD (and the voice editor)
+          C = 'src/UI/UnifiedShell.cpp'
+          sub1(C, '    dock_kind(w, 0);\n    int b = (slot == 2) ? 1 : (slot == 3) ? 2 : 0;',
+               '    {   // the Close button in the corner is not needed inside the window\n'
+               '        Fl_Widget *closebtn = find_by_label(w, "Close");\n'
+               '        if(closebtn)\n'
+               '            closebtn->hide();\n'
+               '    }\n'
+               '    dock_kind(w, 0);\n    int b = (slot == 2) ? 1 : (slot == 3) ? 2 : 0;')
+          print('stage 25 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
@@ -4830,11 +4905,116 @@ jobs:
           # zlib next to the plugin, in case it is still imported (this fixed FL Studio)
           [ -f /mingw32/bin/libz-1.dll ] && cp -n /mingw32/bin/libz-1.dll out/vst/
           cd out && zip -r ../ZYNNM-XT-win32.zip .
+      - name: Write installer script
+        run: |
+          mkdir -p installer
+          cat > installer/zynnm-xt.iss <<'ISSEOF'
+          ; ZYNNM XT installer (Inno Setup 6)
+          #ifndef SrcDir
+            #define SrcDir "out"
+          #endif
+
+          [Setup]
+          AppId={{7B3F5C0E-2D41-4C6A-9E57-5A1C2B8D4E10}
+          AppName=ZYNNM XT
+          AppVersion=1.0 beta
+          AppPublisher=ZYNNM XT
+          DefaultDirName={autopf}\ZYNNM XT
+          DefaultGroupName=ZYNNM XT
+          DisableProgramGroupPage=yes
+          OutputBaseFilename=ZYNNM-XT-Setup
+          Compression=lzma2
+          SolidCompression=yes
+          PrivilegesRequired=lowest
+          PrivilegesRequiredOverridesAllowed=dialog
+          WizardStyle=modern
+          UninstallDisplayName=ZYNNM XT
+          #if FileExists(SrcDir + "\LICENSE-GPL.txt")
+          LicenseFile={#SrcDir}\LICENSE-GPL.txt
+          #endif
+
+          [Types]
+          Name: "full"; Description: "Full installation"
+          Name: "custom"; Description: "Custom installation"; Flags: iscustom
+
+          [Components]
+          Name: "app"; Description: "ZYNNM XT standalone program"; Types: full custom; Flags: fixed
+          Name: "vst"; Description: "VST plugin (FL Studio, LMMS and other hosts)"; Types: full custom
+          Name: "presets"; Description: "Instrument presets"; Types: full custom
+
+          [Tasks]
+          Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
+
+          [Files]
+          Source: "{#SrcDir}\ZYNNM XT.exe"; DestDir: "{app}"; Components: app; Flags: ignoreversion
+          Source: "{#SrcDir}\*.dll"; DestDir: "{app}"; Components: app; Flags: ignoreversion skipifsourcedoesntexist
+          Source: "{#SrcDir}\LICENSE-GPL.txt"; DestDir: "{app}"; Components: app; Flags: ignoreversion skipifsourcedoesntexist
+          Source: "{#SrcDir}\BUILD-INFO.txt"; DestDir: "{app}"; Components: app; Flags: ignoreversion skipifsourcedoesntexist
+          Source: "{#SrcDir}\pixmaps\*"; DestDir: "{app}\pixmaps"; Components: app; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+          Source: "{#SrcDir}\instruments\*"; DestDir: "{app}\instruments"; Components: presets; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+          Source: "{#SrcDir}\vst\*"; DestDir: "{code:VstDir}"; Components: vst; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
+
+          [Icons]
+          Name: "{group}\ZYNNM XT"; Filename: "{app}\ZYNNM XT.exe"; Components: app
+          Name: "{group}\Uninstall ZYNNM XT"; Filename: "{uninstallexe}"
+          Name: "{autodesktop}\ZYNNM XT"; Filename: "{app}\ZYNNM XT.exe"; Tasks: desktopicon; Components: app
+
+          [Run]
+          Filename: "{app}\ZYNNM XT.exe"; Description: "Start ZYNNM XT"; Flags: nowait postinstall skipifsilent; Components: app
+
+          [UninstallDelete]
+          Type: files; Name: "{app}\zyn-log.txt"
+
+          [Code]
+          var
+            VstPage: TInputDirWizardPage;
+
+          procedure InitializeWizard;
+          begin
+            VstPage := CreateInputDirPage(wpSelectComponents,
+              'VST plugin folder',
+              'Where should the VST plugin be installed?',
+              'The plugin needs its own folder (it comes with a few helper files). Add this folder to the plugin search paths of your host (FL Studio, LMMS, ...).',
+              False, '');
+            VstPage.Add('');
+            VstPage.Values[0] := ExpandConstant('{autopf}\ZYNNM XT\VST');
+          end;
+
+          function ShouldSkipPage(PageID: Integer): Boolean;
+          begin
+            Result := False;
+            if PageID = VstPage.ID then
+              Result := not WizardIsComponentSelected('vst');
+          end;
+
+          function VstDir(Param: String): String;
+          begin
+            Result := VstPage.Values[0];
+          end;
+          ISSEOF
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          choco install innosetup --version=6.2.2 -y --no-progress
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (!(Test-Path $iscc)) { Write-Host 'Inno Setup was not found'; exit 1 }
+          Copy-Item zynaddsubfx-3.0.3\COPYING out\LICENSE-GPL.txt -ErrorAction SilentlyContinue
+          $ws = (Get-Location).Path
+          & $iscc "/DSrcDir=$ws\out" "/O$ws" "$ws\installer\zynnm-xt.iss"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-Item "$ws\ZYNNM-XT-Setup.exe"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ZYNNM-XT-win32
           path: ZYNNM-XT-win32.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ZYNNM-XT-Setup
+          path: ZYNNM-XT-Setup.exe
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         if: always()
         with:
