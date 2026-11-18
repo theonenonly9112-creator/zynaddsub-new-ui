@@ -4733,6 +4733,423 @@ jobs:
           print('stage 25 patches applied')
           PYEOF
 
+      - name: Stage 26 (new stock waveform Abstract pulse)
+        run: |
+          cd zynaddsubfx-3.0.3
+          python3 - <<'PYEOF'
+          def rd(p):
+              return open(p).read()
+
+          def wr(p, s):
+              open(p, 'w').write(s)
+
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          OG = 'src/Synth/OscilGen.cpp'
+          # the name in the engine's option list (index 25 comes after the wavetable, which is 24)
+          sub1(OG, 'rOpt(23,sinesaw) rOpt(24,table)', 'rOpt(23,sinesaw) rOpt(24,table) rOpt(25,abstract pulse)')
+
+          FUNC = r'''// ZYNNM XT "Abstract pulse" (bipolar harmonic wave): a positive pulse, then a negative pulse half a period
+          // later, smooth edges, with a ripple of three humps riding on every pulse. Every half period mirrors the
+          // other one, so the wave has odd harmonics only and no DC. a (0..1) sets the pulse width and the ripple.
+          static float basefunc_abstractpulse(float x, float a)
+          {
+              const float w   = 0.1f + 0.8f * a;                    // pulse width as a part of a half period
+              const float h   = fmodf(x, 0.5f) * 2.0f;              // 0..1 inside the half period
+              const float sgn = (fmodf(x, 1.0f) < 0.5f) ? 1.0f : -1.0f;
+              if(h >= w)
+                  return 0.0f;
+              const float u      = h / w;                           // 0..1 inside the pulse
+              const float env    = sinf(PI * u);                    // smooth rise and fall
+              const float ripple = 1.0f + 0.5f * a * sinf(2.0f * PI * 3.0f * u);
+              return sgn * env * env * ripple;
+          }
+
+          '''
+          sub1(OG, 'typedef float (*base_func)(float, float);\n', FUNC + 'typedef float (*base_func)(float, float);\n')
+          sub1(OG, '    assert(func < 23);', '    assert(func < 25);')
+          sub1(OG, '        basefunc_sinesaw,\n    };\n    return functions[func];',
+               '        basefunc_sinesaw,\n'
+               '        basefunc_triangle,          // slot of index 24 = the wavetable, which is handled before this table is read\n'
+               '        basefunc_abstractpulse,     // index 25\n'
+               '    };\n    return functions[func];')
+
+          # the entry in the waveform menu (after Table, before the hidden "User" entry)
+          UI = 'src/UI/OscilGenUI.fl'
+          sub1(UI, '              label Table\n              xywh {127 127 100 20} labelfont 1 labelsize 11\n            }\n',
+               '              label Table\n              xywh {127 127 100 20} labelfont 1 labelsize 11\n            }\n'
+               '            MenuItem {} {\n'
+               '              label {Abstract pulse}\n'
+               '              xywh {127 127 100 20} labelfont 1 labelsize 11\n'
+               '            }\n')
+          print('stage 26 patches applied')
+          PYEOF
+
+      - name: "Stage 27 (Satana saturation effect: effect number 9 in every effect slot)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          mkdir -p /tmp/zynnm_files
+          cat > /tmp/zynnm_files/Satana.h <<'HEOF'
+          /*
+            ZYNNM XT - Satana.h - saturation effect
+            Based on the LADSPA plugin "Satana" by Jean Zundel <jzu@free.fr> (2012), GNU GPL version 3 or later.
+            Adapted as an effect of ZynAddSubFX (GNU GPL version 2 or later).
+          */
+          #ifndef SATANA_H
+          #define SATANA_H
+
+          #include "Effect.h"
+          #include "SatanaCore.h"
+
+          namespace zyn {
+
+          /**Satana saturation effect*/
+          class Satana:public Effect
+          {
+              public:
+                  Satana(EffectParams pars);
+                  ~Satana() {}
+                  void out(const Stereo<float *> &smp);
+                  void setpreset(unsigned char npreset);
+                  void changepar(int npar, unsigned char value);
+                  unsigned char getpar(int npar) const;
+                  void cleanup(void);
+
+                  static rtosc::Ports ports;
+
+              private:
+                  //Parameters
+                  unsigned char Pvolume;    //Volume or D/W
+                  unsigned char Pcompress;  //how many times the sine is applied   (0..127 -> 0..10)
+                  unsigned char Pselect;    //selectivity of the filtering          (0..127 -> 0..10)
+                  unsigned char Pefficiency;//size of the filter, 5 to 25 taps     (0..127 -> 5..25)
+                  unsigned char Plevel;     //output level                          (0..127 -> 0..1)
+
+                  void setvolume(unsigned char _Pvolume);
+
+                  SatanaCore chl, chr;
+          };
+
+          }
+
+          #endif
+          HEOF
+          cat > /tmp/zynnm_files/Satana.cpp <<'HEOF'
+          /*
+            ZYNNM XT - Satana.cpp - saturation effect
+            Based on the LADSPA plugin "Satana" by Jean Zundel <jzu@free.fr> (2012), GNU GPL version 3 or later.
+            Adapted as an effect of ZynAddSubFX (GNU GPL version 2 or later).
+          */
+
+          #include "Satana.h"
+          #include <cmath>
+          #include <rtosc/ports.h>
+          #include <rtosc/port-sugar.h>
+
+          namespace zyn {
+
+          #define rObject Satana
+          #define rBegin [](const char *msg, rtosc::RtData &d) {
+          #define rEnd }
+
+          rtosc::Ports Satana::ports = {
+              {"preset::i", rProp(parameter)
+                            rOptions(Warm, Crunch, Fire, Subtle)
+                            rDoc("Instrument Presets"), 0,
+                            rBegin;
+                            rObject *o = (rObject*)d.obj;
+                            if(rtosc_narguments(msg))
+                                o->setpreset(rtosc_argument(msg, 0).i);
+                            else
+                                d.reply(d.loc, "i", o->Ppreset);
+                            rEnd},
+              rEffParVol(rDefault(127)),
+              rEffParPan(),
+              rEffPar(Pcompress,   2, rShort("comp"), rLinear(0, 127), rDefault(13),
+                      "Compression (how many times the sine is applied)"),
+              rEffPar(Pselect,     3, rShort("sel"),  rLinear(0, 127), rDefault(64),
+                      "Selectivity (all harmonics ... only a few)"),
+              rEffPar(Pefficiency, 4, rShort("eff"),  rLinear(0, 127), rDefault(64),
+                      "Efficiency (size of the filter: 5 to 25 taps)"),
+              rEffPar(Plevel,      5, rShort("level"), rLinear(0, 127), rDefault(110),
+                      "Output level"),
+          };
+          #undef rBegin
+          #undef rEnd
+          #undef rObject
+
+          Satana::Satana(EffectParams pars)
+              :Effect(pars),
+                Pvolume(127),
+                Pcompress(13),
+                Pselect(64),
+                Pefficiency(64),
+                Plevel(110)
+          {
+              setpreset(Ppreset);
+              cleanup();
+          }
+
+          //Cleanup the effect
+          void Satana::cleanup(void)
+          {
+              chl.clear();
+              chr.clear();
+          }
+
+          //Effect output
+          void Satana::out(const Stereo<float *> &smp)
+          {
+              const int   compr = (Pcompress * 10 + 63) / 127;                 // 0..10
+              const float selec = Pselect * 10.0f / 127.0f;                    // 0..10
+              const int   effic = (Pefficiency * 10 + 63) / 127;               // 0..10 (5, 7 ... 25 taps)
+              const float gain  = Plevel / 127.0f;                             // 0..1
+
+              for(int i = 0; i < buffersize; ++i) {
+                  efxoutl[i] = chl.process(smp.l[i] * pangainL * 1.4142136f, compr, selec, effic, gain);
+                  efxoutr[i] = chr.process(smp.r[i] * pangainR * 1.4142136f, compr, selec, effic, gain);
+              }
+          }
+
+          //Parameter control
+          void Satana::setvolume(unsigned char _Pvolume)
+          {
+              Pvolume = _Pvolume;
+
+              if(insertion == 0) {
+                  outvolume = powf(0.01f, (1.0f - Pvolume / 127.0f)) * 4.0f;
+                  volume    = 1.0f;
+              }
+              else
+                  volume = outvolume = Pvolume / 127.0f;
+              if(Pvolume == 0)
+                  cleanup();
+          }
+
+          void Satana::setpreset(unsigned char npreset)
+          {
+              const int     PRESET_SIZE = 6;
+              const int     NUM_PRESETS = 4;
+              unsigned char presets[NUM_PRESETS][PRESET_SIZE] = {
+                  //Warm
+                  {127, 64, 13, 64, 64, 110},
+                  //Crunch
+                  {127, 64, 38, 51, 76, 100},
+                  //Fire
+                  {127, 64, 89, 38, 102, 90},
+                  //Subtle
+                  {64,  64, 6,  64, 38, 127}
+              };
+
+              if(npreset >= NUM_PRESETS)
+                  npreset = NUM_PRESETS - 1;
+              for(int n = 0; n < PRESET_SIZE; ++n)
+                  changepar(n, presets[npreset][n]);
+              if(!insertion) //lower the volume if this is system effect
+                  changepar(0, (int) (presets[npreset][0] / 1.5f));
+              Ppreset = npreset;
+              cleanup();
+          }
+
+          void Satana::changepar(int npar, unsigned char value)
+          {
+              switch(npar) {
+                  case 0:
+                      setvolume(value);
+                      break;
+                  case 1:
+                      setpanning(value);
+                      break;
+                  case 2:
+                      Pcompress = value;
+                      break;
+                  case 3:
+                      Pselect = value;
+                      break;
+                  case 4:
+                      Pefficiency = value;
+                      break;
+                  case 5:
+                      Plevel = value;
+                      break;
+              }
+          }
+
+          unsigned char Satana::getpar(int npar) const
+          {
+              switch(npar) {
+                  case 0:  return Pvolume;
+                  case 1:  return Ppanning;
+                  case 2:  return Pcompress;
+                  case 3:  return Pselect;
+                  case 4:  return Pefficiency;
+                  case 5:  return Plevel;
+                  default: return 0; //in case of bogus parameter number
+              }
+          }
+
+          }
+          HEOF
+          cat > /tmp/zynnm_files/SatanaCore.h <<'HEOF'
+          #pragma once
+          // ZYNNM XT - Satana saturation, the signal path.
+          // Based on the LADSPA plugin "Satana" by Jean Zundel <jzu@free.fr> (2012), GNU GPL version 3 or later.
+          // The original works on whole buffers; here every sample is handled as it arrives (a few samples of delay)
+          // so it works with the small blocks of the synth.
+          #include <cmath>
+
+          namespace zyn {
+
+          struct SatanaCore
+          {
+              enum { HLF = 12, LEN = 25, MASK = 31 };   // 25 filter taps, history of 32 samples
+
+              float    hist[32];
+              unsigned w;
+
+              SatanaCore() { clear(); }
+
+              void clear()
+              {
+                  for(int i = 0; i < 32; ++i)
+                      hist[i] = 0.0f;
+                  w = 0;
+              }
+
+              // compr 0..10 (how many times the sine is applied), selec 0..10 (how selective the filtering is),
+              // effic 0..10 (a row of the filter table: 5 to 25 taps), gain 0..1
+              inline float process(float x, int compr, float selec, int effic, float gain)
+              {
+                  static const float matrix[11][25] = {
+          #include "SatanaMatrix.inc"
+                  };
+                  const float halfpi = 1.57079632679489661923f;
+                  const float clip   = (float)compr / 5.0f;
+
+                  // clipping: the positive half is rounded, the negative half is cut (like a triode), then the compression
+                  float v = x;
+                  if(v > 0.0f)
+                      v = sinf(sinf(v * halfpi) * halfpi) / (1.0f + clip) * clip + v * (1.0f - clip);
+                  else if(v < -(1.0f - clip / 2.0f))
+                      v = -(1.0f - clip / 2.0f);
+                  for(int c = 0; c < compr; ++c)
+                      v = sinf(v * halfpi);
+
+                  hist[w & MASK] = v;
+                  ++w;
+
+                  // the sample in the middle of the last 25, filtered with the chosen row of the table
+                  const float *row = matrix[effic < 0 ? 0 : (effic > 10 ? 10 : effic)];
+                  float        sum = 0.0f;
+                  for(int k = 0; k < LEN; ++k)
+                      sum += hist[(w - LEN + k) & MASK] * row[k];
+                  const float xc   = hist[(w - LEN + HLF) & MASK];
+                  const float ax   = fabsf(xc);
+                  const float f    = powf(ax, selec);
+                  const float sign = (xc < 0.0f) ? -1.0f : 1.0f;
+                  return (f * fabsf(sum) + (1.0f - f) * ax) * gain * sign;
+              }
+          };
+
+          }   // namespace zyn
+          HEOF
+          cat > /tmp/zynnm_files/SatanaMatrix.inc <<'HEOF'
+              {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -0.0857f, 0.3429f, 0.4857f, 0.3429f, -0.0857f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+              {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -0.0952f, 0.1429f, 0.2857f, 0.3333f, 0.2857f, 0.1429f, -0.0952f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+              {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -0.0909f, 0.0606f, 0.1688f, 0.2338f, 0.2554f, 0.2338f, 0.1688f, 0.0606f, -0.0909f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+              {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -0.0839f, 0.0210f, 0.1026f, 0.1608f, 0.1958f, 0.2075f, 0.1958f, 0.1608f, 0.1026f, 0.0210f, -0.0839f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+              {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -0.0769f, 0.0f, 0.0629f, 0.1119f, 0.1469f, 0.1678f, 0.1748f, 0.1678f, 0.1469f, 0.1119f, 0.0629f, 0.0f, -0.0769f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+              {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, -0.0706f, -0.0118f, 0.0380f, 0.0787f, 0.1104f, 0.1330f, 0.1466f, 0.1511f, 0.1466f, 0.1330f, 0.1104f, 0.0787f, 0.0380f, -0.0118f, -0.0706f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+              {0.0f, 0.0f, 0.0f, 0.0f, -0.0650f, -0.0186f, 0.0217f, 0.0557f, 0.0836f, 0.1053f, 0.1207f, 0.1300f, 0.1331f, 0.1300f, 0.1207f, 0.1053f, 0.0836f, 0.0557f, 0.0217f, -0.0186f, -0.0650f, 0.0f, 0.0f, 0.0f, 0.0f},
+              {0.0f, 0.0f, 0.0f, 0.0f, -0.0827f, 0.0106f, 0.0394f, 0.0637f, 0.0836f, 0.0991f, 0.1101f, 0.1168f, 0.1190f, 0.1168f, 0.1101f, 0.0991f, 0.0836f, 0.0637f, 0.0394f, 0.0106f, -0.0827f, 0.0f, 0.0f, 0.0f, 0.0f},
+              {0.0f, 0.0f, 0.0f, -0.0807f, 0.0029f, 0.0275f, 0.0487f, 0.0667f, 0.0814f, 0.0928f, 0.1010f, 0.1059f, 0.1076f, 0.1059f, 0.1010f, 0.0928f, 0.0814f, 0.0667f, 0.0487f, 0.0275f, 0.0029f, -0.0807f, 0.0f, 0.0f, 0.0f},
+              {0.0f, -0.0522f, -0.0261f, -0.0025f, 0.0186f, 0.0373f, 0.0534f, 0.0671f, 0.0783f, 0.0870f, 0.0932f, 0.0969f, 0.0981f, 0.0969f, 0.0932f, 0.0870f, 0.0783f, 0.0671f, 0.0534f, 0.0373f, 0.0186f, -0.0025f, -0.0261f, -0.0522f, 0.0f},
+              {-0.0489f, -0.0267f, -0.0064f, 0.0120f, 0.0284f, 0.0429f, 0.0555f, 0.0663f, 0.0748f, 0.0815f, 0.0864f, 0.0893f, 0.0902f, 0.0893f, 0.0864f, 0.0815f, 0.0748f, 0.0663f, 0.0555f, 0.0429f, 0.0284f, 0.0120f, -0.0064f, -0.0267f, -0.0489f}
+          HEOF
+          python3 - <<'PYEOF'
+          import re, shutil
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # ---- the effect itself ----
+          for f in ('Satana.h', 'Satana.cpp', 'SatanaCore.h', 'SatanaMatrix.inc'):
+              shutil.copy('/tmp/zynnm_files/' + f, 'src/Effects/' + f)
+          sub1('src/Effects/CMakeLists.txt', '\tEffects/Reverb.cpp\n', '\tEffects/Reverb.cpp\n\tEffects/Satana.cpp\n')
+
+          # ---- effect manager: new effect number 9 ----
+          E = 'src/Effects/EffectMgr.cpp'
+          sub1(E, '#include "DynamicFilter.h"\n', '#include "DynamicFilter.h"\n#include "Satana.h"\n')
+          sub1(E, 'Phaser, Alienwah, Distortion, EQ, DynFilter) rDefault(Disabled)', 'Phaser, Alienwah, Distortion, EQ, DynFilter, Satana) rDefault(Disabled)')
+          sub1(E, '    rSubtype(Reverb),\n', '    rSubtype(Reverb),\n    rSubtype(Satana),\n')
+          sub1(E, '                efx = memory.alloc<DynamicFilter>(pars, time);\n                break;\n',
+               '                efx = memory.alloc<DynamicFilter>(pars, time);\n                break;\n            case 9:\n                efx = memory.alloc<Satana>(pars);\n                break;\n')
+
+          # ---- the effect windows ----
+          def dial(name, label, tip, x, par):
+              return ('      Fl_Dial %s {\n        label %s\n        tooltip {%s} xywh {%d 40 30 30} box ROUND_UP_BOX labelfont 1 labelsize 11 maximum 127\n'
+                      '        code0 {o->init("parameter%d");}\n        class Fl_Osc_Dial\n      }\n') % (name, label, tip, x, par)
+          def items():
+              return ''.join('        MenuItem {} {\n          label %s\n          xywh {%d %d 100 20} labelfont 1 labelsize 10\n        }\n' % (n, 20 + 10 * i, 20 + 10 * i)
+                             for i, n in enumerate(['Warm', 'Crunch', 'Fire', 'Subtle']))
+          FULL = ('  Function {make_satana_window()} {} {\n    Fl_Window effsatanawindow {\n      xywh {553 286 380 100} type Double box UP_BOX color 221 labelfont 1 labelsize 19\n'
+                  '      code0 {set_module_parameters(o);}\n      class Fl_Group visible\n    } {\n'
+                  '      Fl_Choice satp {\n        label Preset\n        xywh {11 15 95 15} box UP_BOX down_box BORDER_BOX color 14 selection_color 7 labelfont 1 labelsize 10 align 5 textfont 1 textsize 10\n'
+                  '        code0 {o->init("preset");}\n        class Fl_Osc_Choice\n      } {\n' + items() + '      }\n'
+                  + dial('satp0', 'Vol', 'Effect Volume', 10, 0) + dial('satp1', 'Pan', 'Panning', 45, 1)
+                  + dial('satp2', 'Comp.', 'Compression: how many times the sine is applied', 100, 2)
+                  + dial('satp3', 'Sel.', 'Selectivity: all harmonics ... only a few', 135, 3)
+                  + dial('satp4', 'Eff.', 'Efficiency: size of the filter, 5 to 25 taps', 170, 4)
+                  + dial('satp5', 'Level', 'Output level', 205, 5)
+                  + '    }\n  }\n')
+          SIMPLE = ('  Function {make_satana_window()} {} {\n    Fl_Window effsatanawindow {\n      xywh {88 881 230 100} type Double box UP_BOX color 51 labelfont 1 labelsize 19\n'
+                    '      code3 {set_module_parameters(o);}\n      class Fl_Group visible\n    } {\n'
+                    '      Fl_Choice satp {\n        label Preset\n        xywh {11 15 95 15} box UP_BOX down_box BORDER_BOX color 47 selection_color 7 labelfont 1 labelsize 10 align 5 textfont 1 textsize 10\n'
+                    '        code0 {o->init("preset");}\n        class Fl_Osc_Choice\n      } {\n' + items() + '      }\n    }\n  }\n')
+
+          U = 'src/UI/EffUI.fl'
+          s = rd(U)
+          anchor = '  Function {make_eq_window()} {} {\n'
+          pos = [m.start() for m in re.finditer(re.escape(anchor), s)]
+          assert len(pos) == 2, pos
+          s = s[:pos[1]] + SIMPLE + s[pos[1]:]
+          s = s[:pos[0]] + FULL + s[pos[0]:]
+          assert s.count('make_dynamicfilter_window();\n') == 2
+          s = s.replace('make_dynamicfilter_window();\n', 'make_dynamicfilter_window();\nmake_satana_window();\n')
+          assert s.count('effdynamicfilterwindow->position(px,py);') == 2
+          s = s.replace('effdynamicfilterwindow->position(px,py);', 'effdynamicfilterwindow->position(px,py);\neffsatanawindow->position(px,py);')
+          assert s.count('effdynamicfilterwindow->hide();\n') == 2
+          s = s.replace('effdynamicfilterwindow->hide();\n', 'effdynamicfilterwindow->hide();\neffsatanawindow->hide();\n')
+          assert s.count('\teffdynamicfilterwindow->show();\n\tbreak;\n') == 2
+          s = s.replace('\teffdynamicfilterwindow->show();\n\tbreak;\n', '\teffdynamicfilterwindow->show();\n\tbreak;\n     case 9:\n\teffsatanawindow->show();\n\tbreak;\n')
+          assert s.count('        distp0->label("D/W");\n        dfp0->label("D/W");\n') == 1
+          s = s.replace('        distp0->label("D/W");\n        dfp0->label("D/W");\n', '        distp0->label("D/W");\n        dfp0->label("D/W");\n        satp0->label("D/W");\n')
+          wr(U, s)
+
+          # ---- the effect type menus (system, insertion and part effects) ----
+          total = 0
+          for f in ('src/UI/MasterUI.fl', 'src/UI/PartUI.fl'):
+              t = rd(f)
+              pat = re.compile(r'( *)MenuItem \{\} \{\n( *)label DynFilter\n( *)xywh \{[^}]*\}([^\n]*)\n( *)\}\n')
+              def rep(m):
+                  return m.group(0) + m.group(0).replace('label DynFilter', 'label Satana')
+              t2, n = pat.subn(rep, t)
+              total += n
+              wr(f, t2)
+          assert total == 5, total
+          print('stage 27 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
