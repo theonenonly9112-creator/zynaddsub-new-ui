@@ -5150,6 +5150,407 @@ jobs:
           print('stage 27 patches applied')
           PYEOF
 
+      - name: "Stage 28 (ZynComp stereo compressor: effect number 10 in every effect slot)"
+        run: |
+          cd zynaddsubfx-3.0.3
+          mkdir -p /tmp/zynnm_files
+          cat > /tmp/zynnm_files/ZynComp.h <<'HEOF'
+          /*
+            ZYNNM XT - ZynComp.h - stereo compressor effect
+
+            DSP math adapted from the CAPS LADSPA plugin "Compress"
+            (Copyright 2004-7 Tim Goetze <tim@quitte.de>, after Steve Harris' "sc1").
+            CAPS is released under the GNU GPL version 2 or later; this port keeps the
+            same license and is adapted as an effect of ZynAddSubFX.
+          */
+          #ifndef ZYNCOMP_H
+          #define ZYNCOMP_H
+
+          #include "Effect.h"
+
+          namespace zyn {
+
+          /**ZynComp stereo compressor effect*/
+          class ZynComp:public Effect
+          {
+              public:
+                  ZynComp(EffectParams pars);
+                  ~ZynComp() {}
+                  void out(const Stereo<float *> &smp);
+                  void setpreset(unsigned char npreset);
+                  void changepar(int npar, unsigned char value);
+                  unsigned char getpar(int npar) const;
+                  void cleanup(void);
+
+                  static rtosc::Ports ports;
+
+                  //the same values as the Pxxx bytes below, as floats for direct
+                  //FLTK UI binding
+                  float threshold_db;  //-60..0   dB
+                  float ratio;         //1..10    (1:n)
+                  float attack_s;      //0.001..1 s
+                  float release_s;     //0.001..1 s
+                  float makeup_db;     //0..24    dB
+                  float knee_db;       //1..10    dB
+
+                  /**The DSP core: compresses both channels in place, `frames` samples.
+                   * exp()/log() run once per buffer at most, never per sample.*/
+                  void process(float *left, float *right, int frames);
+
+              private:
+                  void reset_state(void);
+                  void update_floats(void);
+
+                  //Parameters (0..127, zyn convention: 0 = volume, 1 = panning)
+                  unsigned char Pvolume;    //output level
+                  unsigned char Ppanning;   //panning
+                  unsigned char Pthreshold; //threshold (-60..0 dB)
+                  unsigned char Pratio;     //ratio 1:n (1..10)
+                  unsigned char Pattack;    //attack time (0.001..1 s)
+                  unsigned char Prelease;   //release time (0.001..1 s)
+                  unsigned char Pmakeup;    //makeup gain (0..24 dB)
+                  unsigned char Pknee;      //knee radius (1..10 dB)
+
+                  //per-channel detector state (index 0 = left, 1 = right)
+                  float sum[2];    //running sum of squares over a 4-sample block
+                  float amp[2];    //current block RMS level
+                  float env[2];    //smoothed envelope (per-channel attack/release)
+                  float gain[2];   //current smoothed gain
+                  float gain_t[2]; //target gain for the current block
+                  int   count;     //4-sample block phase counter
+          };
+
+          }
+
+          #endif //ZYNCOMP_H
+          HEOF
+          cat > /tmp/zynnm_files/ZynComp.cpp <<'HEOF'
+          /*
+            ZYNNM XT - ZynComp.cpp - stereo compressor effect
+            (CAPS "Compress" DSP math, see ZynComp.h for provenance and license)
+          */
+
+          #include "ZynComp.h"
+          #include <cmath>
+          #include <cstring>
+          #include <rtosc/ports.h>
+          #include <rtosc/port-sugar.h>
+
+          namespace zyn {
+
+          #define rObject ZynComp
+          #define rBegin [](const char *msg, rtosc::RtData &d) {
+          #define rEnd }
+
+          rtosc::Ports ZynComp::ports = {
+              {"preset::i", rProp(parameter)
+                            rOptions(Default, Gentle, Limiter)
+                            rDoc("Instrument Presets"), 0,
+                            rBegin;
+                            rObject *o = (rObject*)d.obj;
+                            if(rtosc_narguments(msg))
+                                o->setpreset(rtosc_argument(msg, 0).i);
+                            else
+                                d.reply(d.loc, "i", o->Ppreset);
+                            rEnd},
+              rEffParVol(rDefault(127)),
+              rEffParPan(),
+              rEffPar(Pthreshold, 2, rShort("thr"),   rLinear(0, 127), rDefault(76),
+                      "Threshold (dB)"),
+              rEffPar(Pratio,     3, rShort("ratio"), rLinear(0, 127), rDefault(14),
+                      "Ratio (1:n)"),
+              rEffPar(Pattack,    4, rShort("atk"),   rLinear(0, 127), rDefault(2),
+                      "Attack time (seconds)"),
+              rEffPar(Prelease,   5, rShort("rel"),   rLinear(0, 127), rDefault(19),
+                      "Release time (seconds)"),
+              rEffPar(Pmakeup,    6, rShort("make"),  rLinear(0, 127), rDefault(0),
+                      "Makeup gain (dB)"),
+              rEffPar(Pknee,      7, rShort("knee"),  rLinear(0, 127), rDefault(28),
+                      "Knee radius (dB)"),
+          };
+          #undef rBegin
+          #undef rEnd
+          #undef rObject
+
+          //dB <-> linear converters, called once per buffer at most
+          static inline float zc_db2lin(float db)
+          {
+              return expf(db * 0.11512925464970228f); //ln(10)/20
+          }
+
+          static inline float zc_lin2db(float x)
+          {
+              return 20.0f * log10f(x);
+          }
+
+          ZynComp::ZynComp(EffectParams pars)
+              :Effect(pars),
+                Pvolume(127), Ppanning(64), Pthreshold(76), Pratio(14),
+                Pattack(2), Prelease(19), Pmakeup(0), Pknee(28)
+          {
+              setpanning(Ppanning);
+              update_floats();
+              reset_state();
+          }
+
+          void ZynComp::update_floats(void)
+          {
+              threshold_db = -60.0f + Pthreshold * (60.0f / 127.0f);
+              ratio        = 1.0f + Pratio * (9.0f / 127.0f);
+              attack_s     = 0.001f + Pattack * (0.999f / 127.0f);
+              release_s    = 0.001f + Prelease * (0.999f / 127.0f);
+              makeup_db    = Pmakeup * (24.0f / 127.0f);
+              knee_db      = 1.0f + Pknee * (9.0f / 127.0f);
+          }
+
+          void ZynComp::reset_state(void)
+          {
+              for(int c = 0; c < 2; ++c) {
+                  sum[c] = 0.0f; amp[c] = 0.0f; env[c] = 0.0f;
+                  gain[c] = 1.0f; gain_t[c] = 1.0f;
+              }
+              count = 0;
+          }
+
+          void ZynComp::cleanup(void)
+          {
+              reset_state();
+          }
+
+          void ZynComp::process(float *left, float *right, int frames)
+          {
+              float *const x[2] = {left, right};
+
+              /* ---- once-per-buffer math (never inside the sample loop) ---------- */
+              const float range = zc_db2lin(makeup_db);                 //output trim
+              const float slope = (ratio - 1.0f) / ratio;               //CAPS: (n-1)/n
+              const float ga = expf(-1.0f / (samplerate_f * attack_s)); //attack coeff
+              const float gr = expf(-1.0f / (samplerate_f * release_s));//release coeff
+              const float knee0 = zc_db2lin(threshold_db - knee_db);    //knee edges,
+              const float knee1 = zc_db2lin(threshold_db + knee_db);    //linear domain
+              const float ef_a  = ga * 0.25f;                           //gain smoother
+              const float ef_ai = 1.0f - ef_a;
+              const int start_cnt = count;
+
+              /* ---- per-channel sample loops ------------------------------------- */
+              for(int c = 0; c < 2; ++c) {
+                  float *s = x[c];
+
+                  float sumc = sum[c], ampc = amp[c], envc = env[c];
+                  float gainc = gain[c], gain_tc = gain_t[c];
+                  int cnt = start_cnt; //same block phase for both channels
+
+                  for(int i = 0; i < frames; ++i) {
+                      sumc += s[i] * s[i];
+
+                      //envelope: attack when rising, release when falling (CAPS)
+                      if(ampc > envc)
+                          envc = envc * ga + ampc * (1.0f - ga);
+                      else
+                          envc = envc * gr + ampc * (1.0f - gr);
+
+                      if((cnt++ & 3) == 3) { //every 4 samples: new RMS + target gain
+                          ampc = sqrtf(sumc * 0.25f);
+                          sumc = 0.0f;
+
+                          if(envc < knee0)                 //below knee: no reduction
+                              gain_tc = 1.0f;
+                          else if(envc < knee1) {          //soft knee (quadratic)
+                              float xx = -(threshold_db - knee_db - zc_lin2db(envc))
+                                         / knee_db;
+                              gain_tc = zc_db2lin(-knee_db * slope * xx * xx * 0.25f);
+                          } else                           //above knee: hard ratio
+                              gain_tc = zc_db2lin((threshold_db - zc_lin2db(envc))
+                                                  * slope);
+                      }
+
+                      gainc = gainc * ef_a + gain_tc * ef_ai;
+                      s[i] *= gainc * range;
+                  }
+
+                  sum[c] = sumc; amp[c] = ampc; env[c] = envc;
+                  gain[c] = gainc; gain_t[c] = gain_tc;
+              }
+
+              count = (start_cnt + frames) & 3; //keep the block phase across buffers
+          }
+
+          void ZynComp::out(const Stereo<float *> &smp)
+          {
+              //zyn convention: input arrives in smp.l/smp.r, result goes into the
+              //efxoutl/efxoutr buffers owned by the base class
+              memcpy(const_cast<float *>(efxoutl), smp.l, buffersize * sizeof(float));
+              memcpy(const_cast<float *>(efxoutr), smp.r, buffersize * sizeof(float));
+              process(const_cast<float *>(efxoutl), const_cast<float *>(efxoutr),
+                      buffersize);
+
+              const float vg = Pvolume / 127.0f;
+              for(int i = 0; i < buffersize; ++i) {
+                  efxoutl[i] *= vg * pangainL;
+                  efxoutr[i] *= vg * pangainR;
+              }
+          }
+
+          void ZynComp::setpreset(unsigned char npreset)
+          {
+              switch(npreset) {
+                  case 1: //"Gentle"
+                      Pthreshold = 89; Pratio = 7;   Pattack = 6;
+                      Prelease = 38;   Pmakeup = 16; Pknee = 71;
+                      break;
+                  case 2: //"Limiter"
+                      Pthreshold = 102; Pratio = 113; Pattack = 0;
+                      Prelease = 6;     Pmakeup = 32; Pknee = 0;
+                      break;
+                  default: //0 = "Default"
+                      Pthreshold = 76; Pratio = 14; Pattack = 2;
+                      Prelease = 19;   Pmakeup = 0; Pknee = 28;
+                      break;
+              }
+              Ppreset = npreset;
+              update_floats();
+              cleanup();
+          }
+
+          void ZynComp::changepar(int npar, unsigned char value)
+          {
+              switch(npar) {
+                  case 0: Pvolume = value; break;
+                  case 1: Ppanning = value; setpanning(Ppanning); break;
+                  case 2: Pthreshold = value; update_floats(); break;
+                  case 3: Pratio = value; update_floats(); break;
+                  case 4: Pattack = value; update_floats(); break;
+                  case 5: Prelease = value; update_floats(); break;
+                  case 6: Pmakeup = value; update_floats(); break;
+                  case 7: Pknee = value; update_floats(); break;
+                  default: break;
+              }
+          }
+
+          unsigned char ZynComp::getpar(int npar) const
+          {
+              switch(npar) {
+                  case 0: return Pvolume;
+                  case 1: return Ppanning;
+                  case 2: return Pthreshold;
+                  case 3: return Pratio;
+                  case 4: return Pattack;
+                  case 5: return Prelease;
+                  case 6: return Pmakeup;
+                  case 7: return Pknee;
+                  default: return 0;
+              }
+          }
+
+          }
+          HEOF
+          python3 - <<'PYEOF'
+          import re, shutil
+
+          def rd(p):
+              with open(p) as f: return f.read()
+          def wr(p, s):
+              with open(p, 'w') as f: f.write(s)
+          def sub1(p, old, new):
+              s = rd(p)
+              assert old in s, 'anchor not found in %s: %r' % (p, old[:60])
+              wr(p, s.replace(old, new, 1))
+
+          for f in ('ZynComp.h', 'ZynComp.cpp'):
+              shutil.copy('/tmp/zynnm_files/' + f, 'src/Effects/' + f)
+
+          # ---- build system: compile the new effect into everything ----
+          sub1('src/Effects/CMakeLists.txt', '\tEffects/Satana.cpp\n',
+               '\tEffects/Satana.cpp\n\tEffects/ZynComp.cpp\n')
+
+          # ---- effect manager: new effect number 10 ----
+          E = 'src/Effects/EffectMgr.cpp'
+          sub1(E, '#include "Satana.h"\n', '#include "Satana.h"\n#include "ZynComp.h"\n')
+          sub1(E, 'Phaser, Alienwah, Distortion, EQ, DynFilter, Satana) rDefault(Disabled)',
+                  'Phaser, Alienwah, Distortion, EQ, DynFilter, Satana, ZynComp) rDefault(Disabled)')
+          sub1(E, '    rSubtype(Satana),\n', '    rSubtype(Satana),\n    rSubtype(ZynComp),\n')
+          sub1(E, '            case 9:\n                efx = memory.alloc<Satana>(pars);\n                break;\n',
+                  '            case 9:\n                efx = memory.alloc<Satana>(pars);\n                break;\n            case 10:\n                efx = memory.alloc<ZynComp>(pars);\n                break;\n')
+
+          # ---- the effect windows (full editor + simple slot-editor variant) ----
+          def dial(name, label, tip, x, par):
+              return ('      Fl_Dial %s {\n        label %s\n        tooltip {%s} xywh {%d 40 30 30} box ROUND_UP_BOX labelfont 1 labelsize 11 maximum 127\n'
+                      '        code0 {o->init("parameter%d");}\n        class Fl_Osc_Dial\n      }\n') % (name, label, tip, x, par)
+
+          def items():
+              return ''.join('        MenuItem {} {\n          label %s\n          xywh {%d %d 100 20} labelfont 1 labelsize 10\n        }\n' % (n, 20 + 10 * i, 20 + 10 * i)
+                             for i, n in enumerate(['Default', 'Gentle', 'Limiter']))
+
+          FULL = ('  Function {make_zyncomp_window()} {} {\n'
+                  '    Fl_Window effzyncompwindow {\n'
+                  '      xywh {553 396 460 100} type Double box UP_BOX color 221 labelfont 1 labelsize 19\n'
+                  '      code0 {set_module_parameters(o);}\n'
+                  '      class Fl_Group visible\n'
+                  '    } {\n'
+                  '      Fl_Choice zcp {\n'
+                  '        label Preset\n'
+                  '        xywh {11 15 95 15} box UP_BOX down_box BORDER_BOX color 14 selection_color 7 labelfont 1 labelsize 10 align 5 textfont 1 textsize 10\n'
+                  '        code0 {o->init("preset");}\n'
+                  '        class Fl_Osc_Choice\n'
+                  '      } {\n' + items() + '      }\n'
+                  + dial('zcp0', 'Vol', 'Output level', 10, 0)
+                  + dial('zcp1', 'Pan', 'Panning', 45, 1)
+                  + dial('zcp2', 'Thr', 'Threshold (dB)', 100, 2)
+                  + dial('zcp3', 'Ratio', 'Ratio (1:n)', 135, 3)
+                  + dial('zcp4', 'Atk', 'Attack time (seconds)', 170, 4)
+                  + dial('zcp5', 'Rel', 'Release time (seconds)', 205, 5)
+                  + dial('zcp6', 'Make', 'Makeup gain (dB)', 240, 6)
+                  + dial('zcp7', 'Knee', 'Knee radius (dB)', 275, 7)
+                  + '    }\n  }\n')
+
+          SIMPLE = ('  Function {make_zyncomp_window()} {} {\n'
+                    '    Fl_Window effzyncompwindow {\n'
+                    '      xywh {88 991 230 100} type Double box UP_BOX color 51 labelfont 1 labelsize 19\n'
+                    '      code3 {set_module_parameters(o);}\n'
+                    '      class Fl_Group visible\n'
+                    '    } {\n'
+                    '      Fl_Choice zcp {\n'
+                    '        label Preset\n'
+                    '        xywh {11 15 95 15} box UP_BOX down_box BORDER_BOX color 47 selection_color 7 labelfont 1 labelsize 10 align 5 textfont 1 textsize 10\n'
+                    '        code0 {o->init("preset");}\n'
+                    '        class Fl_Osc_Choice\n'
+                    '      } {\n' + items() + '      }\n'
+                    + '    }\n  }\n')
+
+          U = 'src/UI/EffUI.fl'
+          s = rd(U)
+          anchor = '  Function {make_eq_window()} {} {\n'
+          pos = [m.start() for m in re.finditer(re.escape(anchor), s)]
+          assert len(pos) == 2, pos
+          s = s[:pos[1]] + SIMPLE + s[pos[1]:]
+          s = s[:pos[0]] + FULL + s[pos[0]:]
+          assert s.count('make_dynamicfilter_window();\nmake_satana_window();\n') == 2
+          s = s.replace('make_dynamicfilter_window();\nmake_satana_window();\n',
+                        'make_dynamicfilter_window();\nmake_satana_window();\nmake_zyncomp_window();\n')
+          assert s.count('effsatanawindow->position(px,py);') == 2
+          s = s.replace('effsatanawindow->position(px,py);',
+                        'effsatanawindow->position(px,py);\neffzyncompwindow->position(px,py);')
+          assert s.count('effsatanawindow->hide();\n') == 2
+          s = s.replace('effsatanawindow->hide();\n', 'effsatanawindow->hide();\neffzyncompwindow->hide();\n')
+          assert s.count('\teffsatanawindow->show();\n\tbreak;\n') == 2
+          s = s.replace('\teffsatanawindow->show();\n\tbreak;\n',
+                        '\teffsatanawindow->show();\n\tbreak;\n     case 10:\n\teffzyncompwindow->show();\n\tbreak;\n')
+          assert s.count('make_zyncomp_window();\n') == 2
+          wr(U, s)
+
+          # ---- the effect type menus (system, insertion and part effects) ----
+          total = 0
+          for f in ('src/UI/MasterUI.fl', 'src/UI/PartUI.fl'):
+              t = rd(f)
+              pat = re.compile(r'( *)MenuItem \{\} \{\n( *)label Satana\n( *)xywh \{[^}]*\}([^\n]*)\n( *)\}\n')
+              def rep(m):
+                  return m.group(0) + m.group(0).replace('label Satana', 'label ZynComp')
+              t2, n = pat.subn(rep, t)
+              total += n
+              wr(f, t2)
+          assert total == 5, total
+          print('stage 28 patches applied')
+          PYEOF
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
