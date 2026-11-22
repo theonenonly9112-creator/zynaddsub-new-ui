@@ -6129,7 +6129,7 @@ jobs:
             echo "== zlib files"; ls -la $HOME/zstatic/lib/libz.a /mingw32/lib/libz* /mingw32/bin/*z*.dll 2>&1
             echo "== static plugin imports"; objdump -p stash/ZynAddSubFX-static.dll 2>&1 | grep "DLL Name"
             echo "== static build, last lines"; tail -n 30 build-static.log 2>&1
-            echo "== zlib in cmake cache"; grep -i zlib zynaddsubfx-3.0.3/build-static/CMakeCache.txt 2>&1
+            echo "== zlib in cmake cache"; grep -i zlib zynaddsubfx-3.0.3/build-static/CMakeCache.txt 2>&1 || true
           } > out/diagnostics.txt 2>&1
           # one plugin folder for every host: the single-file (static) plugin replaces the dynamic one
           if [ -f "out/vst-lmms/ZYNNM XT.dll" ]; then
