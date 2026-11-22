@@ -6125,6 +6125,9 @@ jobs:
           mv out/zynaddsubfx.exe "out/ZYNNM XT.exe"
           if [ -f out/vst/ZynAddSubFX.dll ]; then mv out/vst/ZynAddSubFX.dll "out/vst/ZYNNM XT.dll"; fi
           if [ -f out/vst/zynaddsubfx-ext-gui.exe ]; then mv out/vst/zynaddsubfx-ext-gui.exe out/vst/ZYNNM-XT-editor.exe; fi
+          set +e
+          mkdir -p out/logs
+          cp -f build.log build-vst.log build-static.log cmake-static.log out/logs/ 2>/dev/null
           {
             echo "== zlib files"; ls -la $HOME/zstatic/lib/libz.a /mingw32/lib/libz* /mingw32/bin/*z*.dll 2>&1
             echo "== static plugin imports"; objdump -p stash/ZynAddSubFX-static.dll 2>&1 | grep "DLL Name"
@@ -6140,7 +6143,7 @@ jobs:
             echo "WARNING: the single-file plugin was not built, out/vst holds the dynamic plugin (needs its DLLs)"
           fi
           # zlib next to the plugin, in case it is still imported (this fixed FL Studio)
-          [ -f /mingw32/bin/libz-1.dll ] && cp -n /mingw32/bin/libz-1.dll out/vst/
+          [ -d out/vst ] && [ -f /mingw32/bin/libz-1.dll ] && cp -n /mingw32/bin/libz-1.dll out/vst/
           cd out && zip -r ../ZYNNM-XT-win32.zip .
       - name: Write installer script
         run: |
