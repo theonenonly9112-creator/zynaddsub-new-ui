@@ -5663,6 +5663,313 @@ jobs:
           print('stage 28 patches applied')
           PYEOF
 
+      - name: Stage 29 (ZynArp arpeggiator - engine hook, OSC ports, ARP tab)
+        run: |
+          cd zynaddsubfx-3.0.3
+          if [ ! -f ../ZynArp.h ]; then
+            echo "::error::ZynArp.h must be in the repository root, next to the yml"
+            exit 1
+          fi
+          cp ../ZynArp.h src/Misc/ZynArp.h
+          python3 - <<'PYEOF'
+          import re
+          def patch(path, old, new, n=1):
+              s = open(path).read()
+              assert s.count(old) == n, (path, old[:70], s.count(old))
+              open(path, 'w').write(s.replace(old, new))
+
+          # ---------------------------------------------------------------- engine: Master.h
+          patch('src/Misc/Master.h', '#include "Microtonal.h"',
+                '#include "Microtonal.h"\n#include "ZynArp.h"')
+          patch('src/Misc/Master.h',
+          '''        void noteOn(char chan, char note, char velocity);
+                  void noteOff(char chan, char note);
+          ''',
+          '''        void noteOn(char chan, char note, char velocity);    // MIDI input: the arpeggiator may take the note
+                  void noteOff(char chan, char note);
+                  void noteOnDirect(char chan, char note, char velocity);   // straight to the synth parts
+                  void noteOffDirect(char chan, char note);
+
+                  // ---- arpeggiator (ZynArp) ----
+                  ZynArp arp;                               // lives as long as the Master
+                  double hostBpm   = 0.0;                   // tempo of the host, 0 = no host (standalone)
+                  double arpUiBpm  = 120.0;                 // tempo used when there is no host
+                  void setHostBpm(double bpm) { hostBpm = bpm; }
+                  static void arpSink(void *user, const ZynArp::MidiEvent &ev);
+          ''')
+
+          # ---------------------------------------------------------------- engine: Master.cpp
+          patch('src/Misc/Master.cpp', '    bToU = NULL;\n    uToB = NULL;\n',
+                '    bToU = NULL;\n    uToB = NULL;\n\n    arp.setSink(&Master::arpSink, this);      // arpeggiator output goes straight to the synth\n')
+
+          patch('src/Misc/Master.cpp',
+          '''void Master::noteOn(char chan, char note, char velocity)
+          {
+              if(velocity) {''',
+          '''// MIDI sink of the arpeggiator: the generated notes go to the synth, not through the arpeggiator again
+          void Master::arpSink(void *user, const ZynArp::MidiEvent &ev)
+          {
+              Master *M = (Master*)user;
+              if(ev.isNoteOn())
+                  M->noteOnDirect(ev.channel(), ev.note, ev.velocity);
+              else
+                  M->noteOffDirect(ev.channel(), ev.note);
+          }
+
+          // MIDI input hijack: when the arpeggiator takes the note, the synth does not hear it
+          void Master::noteOn(char chan, char note, char velocity)
+          {
+              if(velocity > 0)
+                  arp.setChannel(chan);                 // the pattern plays on the channel of the keys
+              if(arp.playNote(note, velocity))          // velocity 0 = note off
+                  return;
+              noteOnDirect(chan, note, velocity);
+          }
+
+          void Master::noteOnDirect(char chan, char note, char velocity)
+          {
+              if(velocity) {''')
+          patch('src/Misc/Master.cpp',
+          '''    else
+                  this->noteOff(chan, note);
+              HDDRecorder.triggernow();
+          }''',
+          '''    else
+                  this->noteOffDirect(chan, note);
+              HDDRecorder.triggernow();
+          }''')
+          patch('src/Misc/Master.cpp',
+          '''void Master::noteOff(char chan, char note)
+          {
+              for(int npart''',
+          '''void Master::noteOff(char chan, char note)
+          {
+              if(arp.playNote(note, 0))
+                  return;
+              noteOffDirect(chan, note);
+          }
+
+          void Master::noteOffDirect(char chan, char note)
+          {
+              for(int npart''')
+          # a panic / preset load turns the sounding arp note off
+          patch('src/Misc/Master.cpp', 'void Master::ShutUp()\n{\n',
+                'void Master::ShutUp()\n{\n    arp.allNotesOff();\n')
+          # the clock: once per synth buffer, after the OSC events (so the arp settings of this buffer are in)
+          patch('src/Misc/Master.cpp',
+          '''    //Handle watch points
+              if(bToU)
+                  watcher.write_back = bToU;''',
+          '''    //Arpeggiator clock: host tempo when there is one, else the tempo of the ARP tab
+              {
+                  arp.setBpm(hostBpm > 1.0 ? hostBpm : arpUiBpm);
+                  arp.tick((double)synth.buffersize / (double)synth.samplerate);
+              }
+
+              //Handle watch points
+              if(bToU)
+                  watcher.write_back = bToU;''')
+          # OSC ports for the UI (the editor of the plugin is another process and can only talk OSC)
+          patch('src/Misc/Master.cpp',
+          '''    {"noteOn:iii", rDoc("Noteon Event"), 0,''',
+          '''    {"arp_enabled::T:F", rProp(parameter) rDoc("Arpeggiator on / off"), 0,
+                  [](const char *m, rtosc::RtData &d) {
+                      Master *M = (Master*)d.obj;
+                      if(rtosc_narguments(m) == 0)
+                          d.reply(d.loc, M->arp.enabled() ? "T" : "F");
+                      else {
+                          M->arp.setEnabled(rtosc_argument(m,0).T);
+                          d.broadcast(d.loc, M->arp.enabled() ? "T" : "F");
+                      }}},
+              {"arp_interval::i", rProp(parameter) rLinear(0,9) rDoc("Arpeggiator step length (0 = 1/1 ... 9 = 1/64)"), 0,
+                  [](const char *m, rtosc::RtData &d) {
+                      Master *M = (Master*)d.obj;
+                      if(rtosc_narguments(m) == 0)
+                          d.reply(d.loc, "i", (int)M->arp.interval());
+                      else {
+                          M->arp.setInterval((ZynArp::Interval)limit<int>(rtosc_argument(m,0).i, 0, 9));
+                          d.broadcast(d.loc, "i", (int)M->arp.interval());
+                      }}},
+              // the three sliders send their value minus their minimum (that is how Fl_Osc_Slider works):
+              // step -3..3 arrives as 0..6, octaves 1..4 as 0..3, tempo 40..300 as 0..260
+              {"arp_step::i", rProp(parameter) rLinear(0,6) rDoc("Arpeggiator step: value - 3 = -3..3"), 0,
+                  [](const char *m, rtosc::RtData &d) {
+                      Master *M = (Master*)d.obj;
+                      if(rtosc_narguments(m) == 0)
+                          d.reply(d.loc, "i", M->arp.step() + 3);
+                      else {
+                          M->arp.setStep(limit<int>(rtosc_argument(m,0).i, 0, 6) - 3);
+                          d.broadcast(d.loc, "i", M->arp.step() + 3);
+                      }}},
+              {"arp_octaves::i", rProp(parameter) rLinear(0,3) rDoc("Arpeggiator octaves: value + 1 = 1..4"), 0,
+                  [](const char *m, rtosc::RtData &d) {
+                      Master *M = (Master*)d.obj;
+                      if(rtosc_narguments(m) == 0)
+                          d.reply(d.loc, "i", M->arp.octaveRepeats() - 1);
+                      else {
+                          M->arp.setOctaveRepeats(limit<int>(rtosc_argument(m,0).i, 0, 3) + 1);
+                          d.broadcast(d.loc, "i", M->arp.octaveRepeats() - 1);
+                      }}},
+              {"arp_bpm::i", rProp(parameter) rLinear(0,260) rDoc("Arpeggiator tempo without a host: value + 40"), 0,
+                  [](const char *m, rtosc::RtData &d) {
+                      Master *M = (Master*)d.obj;
+                      if(rtosc_narguments(m) == 0)
+                          d.reply(d.loc, "i", (int)(M->arpUiBpm + 0.5) - 40);
+                      else {
+                          M->arpUiBpm = limit<int>(rtosc_argument(m,0).i, 0, 260) + 40;
+                          d.broadcast(d.loc, "i", (int)(M->arpUiBpm + 0.5) - 40);
+                      }}},
+
+              {"noteOn:iii", rDoc("Noteon Event"), 0,''')
+
+          # ---------------------------------------------------------------- plugin: host tempo
+          patch('src/Plugin/ZynAddSubFX/ZynAddSubFX.cpp',
+          '''        uint32_t framesOffset = 0;
+
+                  for (uint32_t i=0; i<midiEventCount; ++i)''',
+          '''        {   // tempo of the host for the arpeggiator (0 = the host gives none)
+                      const TimePosition &tp = getTimePosition();
+                      master->setHostBpm((tp.bbt.valid && tp.bbt.beatsPerMinute > 1.0) ? tp.bbt.beatsPerMinute : 0.0);
+                  }
+
+                  uint32_t framesOffset = 0;
+
+                  for (uint32_t i=0; i<midiEventCount; ++i)''')
+
+          # ---------------------------------------------------------------- UI: ARP tab
+          U = 'src/UI/UnifiedShell.cpp'
+          patch(U, '#include "Fl_Osc_Check.H"\n',
+                '#include "Fl_Osc_Check.H"\n#include "Fl_Osc_Choice.H"\n#include "Fl_Osc_Slider.H"\n#include <FL/Fl_Choice.H>\n#include <FL/Fl_Menu_Item.H>\n')
+          patch(U, 'Fl_Group  *g_pages[5]  = {0, 0, 0, 0, 0};', 'Fl_Group  *g_pages[6]  = {0, 0, 0, 0, 0, 0};')
+          patch(U, 'Fl_Button *g_tabs[5]   = {0, 0, 0, 0, 0};', 'Fl_Button *g_tabs[6]   = {0, 0, 0, 0, 0, 0};')
+          patch(U, 'void show_page(int n)\n{\n    for(int i = 0; i < 5; ++i) {', 'void show_page(int n)\n{\n    for(int i = 0; i < 6; ++i) {')
+          patch(U,
+          '''    static const char *names[5] = {"ENGINES", "FX", "MATRIX", "GLOBAL", "PANEL"};
+              const int ntabs = big ? 5 : 4;
+              for(int i = 0; i < ntabs; ++i) {
+                  Fl_Button *b = new Fl_Button(250 + i * 116, bar_y + 4, 110, TAB_H - 8, names[i]);''',
+          '''    static const char *names[6] = {"ENGINES", "FX", "MATRIX", "GLOBAL", "PANEL", "ARP"};
+              const int ntabs = 6;
+              for(int i = 0; i < ntabs; ++i) {
+                  if(i == 4 && !big)
+                      continue;                         // the small layout has no PANEL tab
+                  Fl_Button *b = new Fl_Button(250 + ((i == 5 && !big) ? 4 : i) * 116, bar_y + 4, 110, TAB_H - 8, names[i]);''')
+          patch(U,
+          '''    for(int i = 0; i < ntabs; ++i)
+                  g_pages[i] = make_page(page_y, page_h, (big && (i == 0 || i == 2)) || i == 1 || i == 3 || i == 4);''',
+          '''    for(int i = 0; i < ntabs; ++i) {
+                  if(i == 4 && !big)
+                      continue;
+                  g_pages[i] = make_page(page_y, page_h, (big && (i == 0 || i == 2)) || i == 1 || i == 3 || i == 4);
+              }
+              build_arp_panel(g_pages[5], page_y);''')
+          patch(U, '// hide every button with this label (the virtual keyboard button is not needed any more)\nstatic void hide_button',
+          '''// ---- ARP tab: the controls talk to the arpeggiator in the synth engine through OSC ----
+
+          // a slider that shows its value in its label (the value arrives from the engine too)
+          class ArpIntSlider : public Fl_Osc_Slider
+          {
+          public:
+              ArpIntSlider(int x, int y, int w, int h, const char *name)
+                  : Fl_Osc_Slider(x, y, w, h), mName(name)
+              {
+                  refresh();
+              }
+              using Fl_Osc_Slider::OSC_value;
+              void OSC_value(int v) override
+              {
+                  Fl_Osc_Slider::OSC_value(v);
+                  refresh();
+              }
+              void cb(void) override
+              {
+                  Fl_Osc_Slider::cb();
+                  refresh();
+              }
+          private:
+              void refresh()
+              {
+                  const double v = value();
+                  char buf[96];
+                  snprintf(buf, sizeof(buf), "%s: %d", mName, (int)(v < 0 ? v - 0.5 : v + 0.5));
+                  copy_label(buf);
+              }
+              const char *mName;
+          };
+
+          static Fl_Menu_Item g_arp_intervals[] = {
+              {"1/1"}, {"1/2"}, {"1/4"}, {"1/4 triplet"}, {"1/8"}, {"1/8 triplet"},
+              {"1/16"}, {"1/16 triplet"}, {"1/32"}, {"1/64"}, {0}
+          };
+
+          static void arp_style_slider(Fl_Slider *s, double lo, double hi)
+          {
+              s->type(FL_HOR_NICE_SLIDER);
+              s->bounds(lo, hi);
+              s->step(1);
+              s->box(FL_FLAT_BOX);
+              s->color(fl_rgb_color(22, 30, 40));
+              s->selection_color(fl_rgb_color(0, 200, 110));
+              s->labelcolor(fl_rgb_color(215, 240, 230));
+              s->labelsize(12);
+              s->align(FL_ALIGN_TOP_LEFT);
+          }
+
+          static void build_arp_panel(Fl_Group *page, int page_y)
+          {
+              if(!page)
+                  return;
+              const int W = WIN_W - 2 * PAD;
+              const int x0 = PAD + 20, y0 = page_y + PAD + 62;
+              const int gap = 18, h = 28;
+              const int cw = 118;                                   // checkbox and choice
+              const int sw = (W - 40 - 2 * cw - 4 * gap) / 3;       // the three sliders
+
+              page->begin();
+
+              Fl_Box *panel = new Fl_Box(PAD, page_y + PAD, W, 150, "ARPEGGIATOR");
+              panel->box(FL_FLAT_BOX);
+              panel->color(fl_rgb_color(22, 30, 40));
+              panel->labelcolor(fl_rgb_color(0, 215, 120));
+              panel->labelfont(FL_HELVETICA_BOLD);
+              panel->labelsize(14);
+              panel->align(FL_ALIGN_TOP_LEFT | FL_ALIGN_INSIDE);
+
+              Fl_Osc_Check *en = new Fl_Osc_Check(x0, y0, cw, h, "Enable");
+              en->labelcolor(fl_rgb_color(215, 240, 230));
+              en->labelsize(13);
+              en->init("arp_enabled");
+
+              Fl_Osc_Choice *iv = new Fl_Osc_Choice(x0 + cw + gap, y0, cw, h, "Interval");
+              iv->align(FL_ALIGN_TOP_LEFT);
+              iv->labelcolor(fl_rgb_color(215, 240, 230));
+              iv->labelsize(12);
+              iv->menu(g_arp_intervals);
+              iv->init("arp_interval");
+
+              int x = x0 + 2 * (cw + gap);
+              ArpIntSlider *st = new ArpIntSlider(x, y0, sw, h, "Step (-3..3, 0 = ping-pong)");
+              arp_style_slider(st, -3, 3);
+              st->init("arp_step", 'i');
+
+              x += sw + gap;
+              ArpIntSlider *oc = new ArpIntSlider(x, y0, sw, h, "Octaves");
+              arp_style_slider(oc, 1, 4);
+              oc->init("arp_octaves", 'i');
+
+              x += sw + gap;
+              ArpIntSlider *bp = new ArpIntSlider(x, y0, sw, h, "Tempo without host (BPM)");
+              arp_style_slider(bp, 40, 300);
+              bp->init("arp_bpm", 'i');
+
+              page->end();
+          }
+
+          // hide every button with this label (the virtual keyboard button is not needed any more)
+          static void hide_button''')
+          print('stage 29 arp patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
