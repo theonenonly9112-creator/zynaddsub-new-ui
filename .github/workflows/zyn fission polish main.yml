@@ -5996,6 +5996,511 @@ jobs:
           print('stage 29 patches applied')
           PYEOF
 
+      - name: Stage 30 (ZynMultiComp 3 band upward/downward compressor from LOMM - effect number 12, one header)
+        run: |
+          cd zynaddsubfx-3.0.3
+          mkdir -p /tmp/zynnm_files
+          cat > /tmp/zynnm_files/ZynMultiComp.h <<'HEOF'
+          /*
+            ZYNNM XT - ZynMultiComp.h - 3 band upward / downward compressor effect, one header, no .cpp
+            Based on LOMM, Copyright (c) 2023 Lost Robot <r94231/at/gmail/dot/com> (LMMS, GNU GPL v2 or later).
+            Adapted as an effect of ZynAddSubFX (GNU GPL v2 or later).
+
+            Kept from LOMM : the Linkwitz-Riley crossovers (3 bands), the RMS detector, the attack / release envelope,
+                             the downward + upward compression curves with a soft knee, the stereo link,
+                             the range limit, the dry path that goes through the same crossover (phase aligned mix).
+            Left out       : every display / meter / spectrum, look ahead, auto time (crest factor), mid/side, feedback
+                             mode, band switches and all per-band knobs (the per-band values are the constants below).
+
+            Only EffectMgr.cpp includes this file, with ZYNMULTICOMP_IMPLEMENTATION defined first: that one include also
+            defines the OSC ports. Everything else in here is inline.
+          */
+          #ifndef ZYNMULTICOMP_H
+          #define ZYNMULTICOMP_H
+
+          #include <cmath>
+          #include "Effect.h"
+
+          namespace zyn {
+
+          //==================================================================== audio math (no Zyn code in here)
+          // DSP BEGIN
+          //----- the per-band values that LOMM has as knobs; edit here to change the character of the effect -----
+          // band order: 0 = high, 1 = mid, 2 = low
+          namespace mcdefaults {
+              const float kSplitHigh = 2500.0f;                    // Hz, mid / high crossover
+              const float kSplitLow  = 88.3f;                      // Hz, low / mid crossover
+              const float kDownThresh[3] = { -24.0f, -24.0f, -22.0f };  // dB, downward compression starts above this
+              const float kDownRatio [3] = {   3.0f,   3.0f,   3.0f };  // x:1
+              const float kUpThresh  [3] = { -40.0f, -40.0f, -40.0f };  // dB, upward compression starts below this
+              const float kUpRatio   [3] = {   2.5f,   2.5f,   2.5f };  // x:1
+              const float kAttackMs  [3] = {  10.0f,  18.0f,  30.0f };  // at Time = x1
+              const float kReleaseMs [3] = { 120.0f, 180.0f, 250.0f };  // at Time = x1
+              const float kKneeDb    = 6.0f;                       // total width of the soft knee
+              const float kRangeDb   = 36.0f;                      // the most gain an upward compressor may add
+              const float kRmsMs     = 10.0f;                      // detector averaging time
+              const float kFloor     = 0.00012589f;                // -72 dBFS, the detector never goes below this
+          }
+
+          //One 2nd order section (transposed direct form II), two channels
+          struct MCBiquad
+          {
+              float b0, b1, b2, a1, a2;
+              float z1[2], z2[2];
+
+              MCBiquad() : b0(1), b1(0), b2(0), a1(0), a2(0) { clear(); }
+              void clear() { z1[0] = z1[1] = z2[0] = z2[1] = 0.0f; }
+
+              inline float process(float x, int ch)
+              {
+                  const float y = b0 * x + z1[ch];
+                  z1[ch] = b1 * x - a1 * y + z2[ch];
+                  z2[ch] = b2 * x - a2 * y;
+                  return y;
+              }
+
+              // RBJ cookbook coefficients
+              void set(int type, float f, float sr, float q)   // 0 lowpass, 1 highpass, 2 allpass
+              {
+                  const float maxf = sr * 0.45f;
+                  if(f > maxf) f = maxf;
+                  const float w  = 6.28318530718f * f / sr;
+                  const float c  = cosf(w);
+                  const float al = sinf(w) / (2.0f * q);
+                  const float a0 = 1.0f + al;
+                  a1 = -2.0f * c / a0;
+                  a2 = (1.0f - al) / a0;
+                  if(type == 0) {
+                      b0 = (1.0f - c) * 0.5f / a0;
+                      b1 = (1.0f - c) / a0;
+                      b2 = b0;
+                  }
+                  else if(type == 1) {
+                      b0 = (1.0f + c) * 0.5f / a0;
+                      b1 = -(1.0f + c) / a0;
+                      b2 = b0;
+                  }
+                  else {
+                      b0 = (1.0f - al) / a0;
+                      b1 = -2.0f * c / a0;
+                      b2 = (1.0f + al) / a0;
+                  }
+              }
+          };
+
+          //Linkwitz-Riley 24 dB/oct = two Butterworth sections (Q = 1/sqrt 2) in a row
+          struct MCLinkwitzRiley
+          {
+              MCBiquad a, b;
+              void set(bool highpass, float f, float sr)
+              {
+                  a.set(highpass ? 1 : 0, f, sr, 0.70710678f);
+                  b.set(highpass ? 1 : 0, f, sr, 0.70710678f);
+              }
+              void clear() { a.clear(); b.clear(); }
+              inline float process(float x, int ch) { return b.process(a.process(x, ch), ch); }
+          };
+
+          class ZynMultiCompDsp
+          {
+          public:
+              ZynMultiCompDsp()
+                  : sampleRate(44100.0f), coeffPrecalc(-2.2f / 44.1f),
+                    inTarget(1.0f), outTarget(1.0f), inVol(1.0f), outVol(1.0f),
+                    depth(1.0f), timeMult(1.0f), mix(1.0f), rmsConst(0.0f)
+              {
+                  for(int j = 0; j < 3; ++j) {
+                      atkCoef[j] = relCoef[j] = 0.0f;
+                  }
+                  setSampleRate(44100.0f);
+                  reset();
+              }
+
+              void setSampleRate(float sr)
+              {
+                  sampleRate   = sr > 8000.0f ? sr : 44100.0f;
+                  coeffPrecalc = -2.2f / (sampleRate * 0.001f);
+                  lp1.set(false, mcdefaults::kSplitHigh, sampleRate);
+                  hp1.set(true,  mcdefaults::kSplitHigh, sampleRate);
+                  lp2.set(false, mcdefaults::kSplitLow,  sampleRate);
+                  hp2.set(true,  mcdefaults::kSplitLow,  sampleRate);
+                  ap.set(2, mcdefaults::kSplitHigh, sampleRate, 0.70710678f);   // keeps the low band in phase with the other two
+                  rmsConst = expf(-1.0f / (mcdefaults::kRmsMs * 0.001f * sampleRate));
+                  updateTimes();
+              }
+
+              //inDb, outDb in dB; depth 0..2 (1 = the ratios as set, 2 = squashes everything to the thresholds);
+              //timeMult scales every attack and release time; mix 0..1 (dry is the crossover sum, so it stays in phase)
+              void setParams(float inDb, float outDb, float depth_, float timeMult_, float mix_)
+              {
+                  inTarget  = expf(inDb  * 0.11512925f);
+                  outTarget = expf(outDb * 0.11512925f);
+                  depth     = depth_ < 0.0f ? 0.0f : depth_;
+                  mix       = mix_ < 0.0f ? 0.0f : (mix_ > 1.0f ? 1.0f : mix_);
+                  timeMult  = timeMult_ < 0.01f ? 0.01f : timeMult_;
+                  updateTimes();
+              }
+
+              //forget everything that is going on (the gains jump straight to their values)
+              void reset()
+              {
+                  lp1.clear(); hp1.clear(); lp2.clear(); hp2.clear(); ap.clear();
+                  for(int j = 0; j < 3; ++j)
+                      for(int i = 0; i < 2; ++i) {
+                          yL[j][i]  = mcdefaults::kFloor;
+                          rms[j][i] = mcdefaults::kFloor;
+                      }
+                  inVol  = inTarget;
+                  outVol = outTarget;
+              }
+
+              //compress left / right in place; the result already holds the mix (an insert effect needs no further dry / wet)
+              void process(float *left, float *right, int frames)
+              {
+                  using namespace mcdefaults;
+                  const float knee     = kKneeDb * 0.5f;
+                  const float rangeAmp = expf(kRangeDb * 0.11512925f);
+                  const float depthOut = depth < 1.0f ? depth : 1.0f;        // the make up volume follows the depth up to 100 %
+                  const float smooth   = 0.003f;                             // gain changes of the knobs are smoothed
+
+                  for(int f = 0; f < frames; ++f) {
+                      inVol  += (inTarget  - inVol)  * smooth;
+                      outVol += (outTarget - outVol) * smooth;
+
+                      float s[2]       = { left[f], right[f] };
+                      float band[3][2], dry[3][2], gain[3][2];
+
+                      for(int i = 0; i < 2; ++i) {
+                          //crossovers: low = lp2, the part above it is split by split 1 into mid and high
+                          float low  = lp2.process(s[i], i);
+                          float up   = hp2.process(s[i], i);
+                          float high = hp1.process(up, i);
+                          float mid  = lp1.process(up, i);
+                          low = ap.process(low, i);
+
+                          dry[0][i] = high;
+                          dry[1][i] = mid;
+                          dry[2][i] = low;
+
+                          for(int j = 0; j < 3; ++j) {
+                              const float x = dry[j][i] * inVol;
+                              band[j][i] = x;
+
+                              //RMS detector
+                              rms[j][i] = rmsConst * rms[j][i] + (1.0f - rmsConst) * x * x;
+                              const float det = fmaxf(kFloor, sqrtf(rms[j][i]));
+
+                              //attack / release
+                              const float c = det > yL[j][i] ? atkCoef[j] : relCoef[j];
+                              yL[j][i] = fmaxf(kFloor, yL[j][i] * c + (1.0f - c) * det);
+
+                              const float y = 8.68588964f * logf(yL[j][i]);      // dBFS
+
+                              //downward compression
+                              float above;
+                              const float dA = y - kDownThresh[j];
+                              if(dA < -knee)
+                                  above = y;
+                              else if(dA < knee) {
+                                  const float t = dA + knee;
+                                  above = y + (1.0f / kDownRatio[j] - 1.0f) * t * t / (4.0f * knee);
+                              }
+                              else
+                                  above = kDownThresh[j] + dA / kDownRatio[j];
+                              if(above < y) {
+                                  const float amount = depth;                    // downward knob = 100 %
+                                  above = amount <= 1.0f ? y + (above - y) * amount
+                                                         : above + (kDownThresh[j] - above) * (amount - 1.0f);
+                              }
+
+                              //upward compression
+                              float below;
+                              const float dB = y - kUpThresh[j];
+                              if(dB > knee)
+                                  below = y;
+                              else if(-dB < knee) {
+                                  const float t = -dB + knee;
+                                  below = y + (1.0f - 1.0f / kUpRatio[j]) * t * t / (4.0f * knee);
+                              }
+                              else
+                                  below = kUpThresh[j] + dB / kUpRatio[j];
+                              if(below > y) {
+                                  const float amount = depth;                    // upward knob = 100 %
+                                  below = amount <= 1.0f ? y + (below - y) * amount
+                                                         : below + (kUpThresh[j] - below) * (amount - 1.0f);
+                              }
+
+                              //both curves as one gain (one exp instead of two pow and two divisions)
+                              float g = expf((above + below - 2.0f * y) * 0.11512925f);
+                              gain[j][i] = g < rangeAmp ? g : rangeAmp;
+                          }
+                      }
+
+                      //stereo link: both channels get the stronger reduction
+                      for(int j = 0; j < 3; ++j) {
+                          const float g = fminf(gain[j][0], gain[j][1]);
+                          gain[j][0] = gain[j][1] = g;
+                      }
+
+                      const float outScale = 1.0f + (outVol - 1.0f) * mix * depthOut;
+                      for(int i = 0; i < 2; ++i) {
+                          float sum = 0.0f;
+                          for(int j = 0; j < 3; ++j) {
+                              const float wet = band[j][i] * gain[j][i];
+                              sum += dry[j][i] + (wet - dry[j][i]) * mix;
+                          }
+                          s[i] = sum * outScale;
+                      }
+                      left[f]  = s[0];
+                      right[f] = s[1];
+                  }
+              }
+
+          private:
+              void updateTimes()
+              {
+                  for(int j = 0; j < 3; ++j) {
+                      atkCoef[j] = expf(coeffPrecalc / (mcdefaults::kAttackMs[j]  * timeMult));
+                      relCoef[j] = expf(coeffPrecalc / (mcdefaults::kReleaseMs[j] * timeMult));
+                  }
+              }
+
+              float sampleRate, coeffPrecalc;
+              float inTarget, outTarget, inVol, outVol, depth, timeMult, mix, rmsConst;
+              float atkCoef[3], relCoef[3];
+              float yL[3][2], rms[3][2];
+              MCLinkwitzRiley lp1, hp1, lp2, hp2;
+              MCBiquad ap;
+          };
+
+
+          // DSP END
+
+          //==================================================================== the Zyn effect
+          /**Three band compressor (low / mid / high, Linkwitz-Riley crossovers) that compresses
+           * downward above and upward below its thresholds. Five controls only, all bands share them.*/
+          class ZynMultiComp:public Effect
+          {
+              public:
+                  ZynMultiComp(EffectParams pars)
+                      :Effect(pars), Pvolume(127), Pinput(64), Poutput(74), Pdepth(38), Ptime(79)
+                  {
+                      dsp.setSampleRate(samplerate_f);
+                      setpreset(Ppreset);
+                      cleanup();
+                  }
+                  ~ZynMultiComp() {}
+
+                  //Cleanup the effect
+                  void cleanup(void) { dsp.reset(); }
+
+                  //Effect output: the dry / wet mix is done inside (the dry path goes through the same crossover, so it stays in phase)
+                  void out(const Stereo<float *> &smp)
+                  {
+                      memcpy(efxoutl, smp.l, bufferbytes);
+                      memcpy(efxoutr, smp.r, bufferbytes);
+                      dsp.process(efxoutl, efxoutr, buffersize);
+                  }
+
+                  void setpreset(unsigned char npreset)
+                  {
+                      const int     PRESET_SIZE = 5;
+                      const int     NUM_PRESETS = 4;
+                      unsigned char presets[NUM_PRESETS][PRESET_SIZE] = {
+                          //mix  in  out depth time
+                          {127, 64, 74,  38,  79},   //Gentle
+                          {127, 70, 80,  64,  60},   //Punchy
+                          {127, 80, 88, 110,  50},   //Heavy
+                          {127, 64, 76,  64, 105}    //Slow
+                      };
+                      if(npreset >= NUM_PRESETS)
+                          npreset = NUM_PRESETS - 1;
+                      for(int n = 0; n < PRESET_SIZE; ++n)
+                          changepar(n, presets[npreset][n]);
+                      Ppreset = npreset;
+                      cleanup();
+                  }
+
+                  void changepar(int npar, unsigned char value)
+                  {
+                      if(value > 127)
+                          value = 127;
+                      switch(npar) {
+                          case 0: setvolume(value);      break;
+                          case 1: Pinput  = value; apply(); break;
+                          case 2: Poutput = value; apply(); break;
+                          case 3: Pdepth  = value; apply(); break;
+                          case 4: Ptime   = value; apply(); break;
+                      }
+                  }
+
+                  unsigned char getpar(int npar) const
+                  {
+                      switch(npar) {
+                          case 0:  return Pvolume;
+                          case 1:  return Pinput;
+                          case 2:  return Poutput;
+                          case 3:  return Pdepth;
+                          case 4:  return Ptime;
+                          default: return 0; //in case of bogus parameter number
+                      }
+                  }
+
+                  static rtosc::Ports ports;
+
+              private:
+                  //Parameters (0..127)
+                  unsigned char Pvolume;   //0: Mix (insert effect) or send level (system effect)
+                  unsigned char Pinput;    //1: input gain  -24 .. +24 dB (64 = 0 dB)
+                  unsigned char Poutput;   //2: output gain -24 .. +24 dB (64 = 0 dB), follows the depth
+                  unsigned char Pdepth;    //3: upward / downward amount 0 .. 2 (64 = 1, the ratios as set)
+                  unsigned char Ptime;     //4: attack / release speed multiplier x0.1 .. x4 (79 = x1)
+
+                  void setvolume(unsigned char _Pvolume)
+                  {
+                      Pvolume = _Pvolume;
+                      if(insertion == 0) {
+                          //system effect: the volume is the send level, the effect itself is fully wet
+                          outvolume = powf(0.01f, (1.0f - Pvolume / 127.0f)) * 4.0f;
+                          volume    = 1.0f;
+                      }
+                      else
+                          //insert effect: Zyn must not crossfade again, the mix is made inside
+                          volume = outvolume = 1.0f;
+                      apply();
+                  }
+
+                  //Stored values 0..127 -> real units -> the compressor
+                  void apply(void)
+                  {
+                      const float inDb  = (Pinput  - 64) * (24.0f / 63.0f);
+                      const float outDb = (Poutput - 64) * (24.0f / 63.0f);
+                      const float depth = Pdepth * (2.0f / 127.0f);
+                      const float time  = 0.1f * powf(40.0f, Ptime / 127.0f);
+                      const float mix   = (insertion == 0) ? 1.0f : Pvolume / 127.0f;
+                      dsp.setParams(inDb, outDb, depth, time, mix);
+                  }
+
+                  ZynMultiCompDsp dsp;
+          };
+
+          }   // namespace zyn
+
+          //==================================================================== OSC ports (once, from EffectMgr.cpp)
+          #ifdef ZYNMULTICOMP_IMPLEMENTATION
+          #include <cstring>
+          #include <rtosc/ports.h>
+          #include <rtosc/port-sugar.h>
+
+          namespace zyn {
+
+          #define rObject ZynMultiComp
+          #define rBegin [](const char *msg, rtosc::RtData &d) {
+          #define rEnd }
+
+          rtosc::Ports ZynMultiComp::ports = {
+              {"preset::i", rProp(parameter)
+                            rOptions(Gentle, Punchy, Heavy, Slow)
+                            rDoc("Instrument Presets"), 0,
+                            rBegin;
+                            rObject *o = (rObject*)d.obj;
+                            if(rtosc_narguments(msg))
+                                o->setpreset(rtosc_argument(msg, 0).i);
+                            else
+                                d.reply(d.loc, "i", o->Ppreset);
+                            rEnd},
+              rEffParVol(rDefault(127)),
+              rEffPar(Pinput,  1, rShort("in"),    rLinear(0, 127), rDefault(64),
+                      "Input gain: -24 to +24 dB"),
+              rEffPar(Poutput, 2, rShort("out"),   rLinear(0, 127), rDefault(74),
+                      "Output gain: -24 to +24 dB"),
+              rEffPar(Pdepth,  3, rShort("depth"), rLinear(0, 127), rDefault(38),
+                      "Upward / downward amount: 0 to 2"),
+              rEffPar(Ptime,   4, rShort("time"),  rLinear(0, 127), rDefault(79),
+                      "Attack / release speed: x0.1 to x4"),
+          };
+          #undef rBegin
+          #undef rEnd
+          #undef rObject
+
+          }   // namespace zyn
+          #endif
+
+          #endif
+          HEOF
+          python3 - <<'PYEOF'
+          import re, shutil
+          def rd(p):
+              return open(p).read()
+          def wr(p, s):
+              open(p, 'w').write(s)
+          def sub1(path, old, new, n=1):
+              s = rd(path)
+              c = s.count(old)
+              assert c == n, (path, old[:70], c)
+              wr(path, s.replace(old, new))
+
+          # ---- the effect: number 12 (after the stereo widener) ----
+          shutil.copy('/tmp/zynnm_files/ZynMultiComp.h', 'src/Effects/ZynMultiComp.h')   # one header, no .cpp, no CMake change
+
+          E = 'src/Effects/EffectMgr.cpp'
+          sub1(E, '#include "StereoWide.h"\n', '#include "StereoWide.h"\n#define ZYNMULTICOMP_IMPLEMENTATION   // this one include also defines the ports\n#include "ZynMultiComp.h"\n')
+          sub1(E, 'Compressor, Widener) rDefault(Disabled)', 'Compressor, Widener, MultiComp) rDefault(Disabled)')
+          sub1(E, '    rSubtype(StereoWide),\n', '    rSubtype(StereoWide),\n    rSubtype(ZynMultiComp),\n')
+          sub1(E, '                efx = memory.alloc<StereoWide>(pars);\n                break;\n',
+               '                efx = memory.alloc<StereoWide>(pars);\n                break;\n            case 12:\n                efx = memory.alloc<ZynMultiComp>(pars);\n                break;\n')
+
+          # ---- the window: a plain box with five knobs ----
+          def dial(name, label, tip, x, par):
+              return ('      Fl_Dial %s {\n        label %s\n        tooltip {%s} xywh {%d 25 30 30} box ROUND_UP_BOX labelfont 1 labelsize 11 maximum 127\n'
+                      '        code0 {o->init("parameter%d");}\n        class Fl_Osc_Dial\n      }\n') % (name, label, tip, x, par)
+          def items():
+              return ''.join('        MenuItem {} {\n          label %s\n          xywh {%d %d 100 20} labelfont 1 labelsize 10\n        }\n' % (n, 20 + 10 * i, 20 + 10 * i)
+                             for i, n in enumerate(['Gentle', 'Punchy', 'Heavy', 'Slow']))
+          FULL = ('  Function {make_multicomp_window()} {} {\n    Fl_Window effmulticompwindow {\n      xywh {553 286 300 85} type Double box UP_BOX color 221 labelfont 1 labelsize 19\n'
+                  '      code0 {set_module_parameters(o);}\n      class Fl_Group visible\n    } {\n'
+                  + dial('mcp1', 'In',    'Input gain: -24 to +24 dB',          10, 1)
+                  + dial('mcp2', 'Out',   'Output gain: -24 to +24 dB',         70, 2)
+                  + dial('mcp3', 'Depth', 'Upward / downward amount: 0 to 2',  130, 3)
+                  + dial('mcp4', 'Time',  'Attack / release speed: x0.1 to x4', 190, 4)
+                  + dial('mcp0', 'Vol',   'Effect Volume',                     250, 0)
+                  + '    }\n  }\n')
+          SIMPLE = ('  Function {make_multicomp_window()} {} {\n    Fl_Window effmulticompwindow {\n      xywh {88 881 230 100} type Double box UP_BOX color 51 labelfont 1 labelsize 19\n'
+                    '      code3 {set_module_parameters(o);}\n      class Fl_Group visible\n    } {\n'
+                    '      Fl_Choice mcpp {\n        label Preset\n        xywh {11 15 95 15} box UP_BOX down_box BORDER_BOX color 47 selection_color 7 labelfont 1 labelsize 10 align 5 textfont 1 textsize 10\n'
+                    '        code0 {o->init("preset");}\n        class Fl_Osc_Choice\n      } {\n' + items() + '      }\n    }\n  }\n')
+
+          U = 'src/UI/EffUI.fl'
+          s = rd(U)
+          anchor = '  Function {make_eq_window()} {} {\n'
+          pos = [m.start() for m in re.finditer(re.escape(anchor), s)]
+          assert len(pos) == 2, pos
+          s = s[:pos[1]] + SIMPLE + s[pos[1]:]
+          s = s[:pos[0]] + FULL + s[pos[0]:]
+          def two(old, new):
+              global s
+              assert s.count(old) == 2, (old, s.count(old))
+              s = s.replace(old, new)
+          two('make_stereowide_window();\n', 'make_stereowide_window();\nmake_multicomp_window();\n')
+          two('effstereowidewindow->position(px,py);', 'effstereowidewindow->position(px,py);\neffmulticompwindow->position(px,py);')
+          two('effstereowidewindow->hide();\n', 'effstereowidewindow->hide();\neffmulticompwindow->hide();\n')
+          two('\teffstereowidewindow->show();\n\tbreak;\n', '\teffstereowidewindow->show();\n\tbreak;\n     case 12:\n\teffmulticompwindow->show();\n\tbreak;\n')
+          assert s.count('        widep0->label("D/W");\n') == 1
+          s = s.replace('        widep0->label("D/W");\n', '        widep0->label("D/W");\n        mcp0->label("Mix");\n')
+          wr(U, s)
+
+          # ---- the effect type menus (4 in the master window and the part window, one more) ----
+          total = 0
+          for f in ('src/UI/MasterUI.fl', 'src/UI/PartUI.fl'):
+              t = rd(f)
+              pat = re.compile(r'( *)MenuItem \{\} \{\n( *)label Widener\n( *)xywh \{[^}]*\}([^\n]*)\n( *)\}\n')
+              t2, n = pat.subn(lambda m: m.group(0) + m.group(0).replace('label Widener', 'label MultiComp'), t)
+              total += n
+              wr(f, t2)
+          assert total == 5, total
+          print('stage 30 patches applied')
+          PYEOF
+
       - name: Configure
         run: |
           cd zynaddsubfx-3.0.3
